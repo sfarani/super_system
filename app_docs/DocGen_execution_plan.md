@@ -70,7 +70,7 @@ Exit Criteria:
 - Snapshots created for key lifecycle changes.
 
 Status:
-- In progress (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, and tests implemented).
+- In progress (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, request clarification action, feature-flagged RBAC scaffolding, document finalization endpoint with QR issuance, PDF artifact stub/hash persistence, parallel all/any execution policies, conditional next-stage hook, actor-resolution adapter hook, archive transition with retention guard, and tests implemented).
 
 ## Phase 3 - Review and Approval Engine
 Duration: 5-7 days
@@ -161,11 +161,11 @@ Exit Criteria:
 - Reporting endpoints provide actionable metrics.
 
 ## Immediate Next Sprint Tasks
-1. Add initial API documentation in app_docs for template and document endpoints.
-2. Prepare Phase 3 workflow action endpoints (request clarification, parallel-stage behavior, conditional branching hooks).
-3. Add permission checks scaffolding for originator/reviewer/approver roles.
-4. Add actor-resolution adapters for role/position/dynamic assignment (COMPASS integration hooks).
-5. Add SLA reminder/escalation task stubs for future Celery integration.
+1. Strengthen permission mapping from groups to formal Django permissions for production rollout.
+2. Replace PDF stub generation with real HTML-to-PDF rendering pipeline and storage adapters.
+3. Implement actor-resolution adapters against COMPASS directory/org-chart services.
+4. Add archive listing/query APIs and retention-policy admin controls.
+5. Defer SLA reminder/escalation Celery tasks to COMPASS integration stage (as agreed).
 
 ## Definition of Done per Phase
 - Code implemented with tests.

@@ -1,3 +1,5 @@
+# pyright: reportAttributeAccessIssue=false
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
@@ -359,7 +361,7 @@ class Document(TimeStampedModel):
 
 	@staticmethod
 	def get_type_code(document_type: str) -> str:
-		code_map = {
+		code_map: dict[str, str] = {
 			DocumentType.OFFICIAL_LETTER: "OL",
 			DocumentType.MEMORANDUM: "MEM",
 			DocumentType.OFFICE_ORDER: "OO",
@@ -369,7 +371,7 @@ class Document(TimeStampedModel):
 			DocumentType.MEETING_RECORD: "MM",
 			DocumentType.SHOW_CAUSE: "SC",
 		}
-		return code_map.get(document_type, "DOC")
+		return code_map.get(str(document_type), "DOC")
 
 	def assign_reference_number(self, org_code: str = "HQ") -> str:
 		if self.reference_number:
@@ -443,6 +445,11 @@ class DocumentWorkflowStage(TimeStampedModel):
 	)
 	stage_order = models.PositiveIntegerField(default=1)
 	title = models.CharField(max_length=160)
+	execution_mode = models.CharField(
+		max_length=20,
+		choices=WorkflowStageMode.choices,
+		default=WorkflowStageMode.SEQUENTIAL,
+	)
 	actor_type = models.CharField(max_length=20, choices=WorkflowActorType.choices)
 	actor_value = models.CharField(max_length=255)
 	required_action = models.CharField(max_length=30, choices=WorkflowActionType.choices)

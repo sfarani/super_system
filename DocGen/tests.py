@@ -2,12 +2,15 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.test.utils import override_settings
+from datetime import timedelta
 import json
 
 from .models import (
 	Document,
 	DocumentQRToken,
 	DocumentType,
+	DocumentWorkflowStage,
 	Template,
 	TemplateCategory,
 	TemplateRevision,
@@ -420,6 +423,254 @@ class DocumentApiTests(TestCase):
 		self.assertEqual(response.status_code, 200)
 		document.refresh_from_db()
 		self.assertEqual(document.status, "UNDER_APPROVAL")
+
+	def test_request_clarification_keeps_document_under_review(self):
+		document = self._create_submitted_document()
+		response = self.client.post(
+			reverse(
+				"docgen:document-action",
+				kwargs={"document_id": document.id, "action": "request_clarification"},
+			),
+			data=json.dumps({"comment": "Need clarification on paragraph 2"}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "UNDER_REVIEW")
+		self.assertEqual(document.revisions.count(), 2)
+
+	def test_finalize_approved_document_sets_finalized_and_qr(self):
+		document = self._create_submitted_document()
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"comment": "Reviewed"}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "approve"}),
+			data=json.dumps({"comment": "Approved"}),
+			content_type="application/json",
+		)
+		finalize_response = self.client.post(
+			reverse("docgen:document-finalize", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(finalize_response.status_code, 200)
+		response_data = finalize_response.json()
+		document.refresh_from_db()
+		self.assertEqual(document.status, "FINALIZED")
+		self.assertIsNotNone(document.finalized_at)
+		self.assertTrue(hasattr(document, "qr_token"))
+		self.assertEqual(document.pdf_versions.count(), 1)
+		pdf = document.pdf_versions.first()
+		self.assertTrue(pdf.is_active)
+		self.assertEqual(len(pdf.sha256_hash), 64)
+		self.assertEqual(response_data["pdf_version"], 1)
+		self.assertEqual(response_data["pdf_sha256"], pdf.sha256_hash)
+
+	def test_finalize_rejected_document_is_blocked(self):
+		document = self._create_submitted_document()
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "reject"}),
+			data=json.dumps({"comment": "Rejected"}),
+			content_type="application/json",
+		)
+		finalize_response = self.client.post(
+			reverse("docgen:document-finalize", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(finalize_response.status_code, 400)
+
+	def _create_finalized_document(self):
+		document = self._create_submitted_document()
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"comment": "Reviewed"}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "approve"}),
+			data=json.dumps({"comment": "Approved"}),
+			content_type="application/json",
+		)
+		finalize_response = self.client.post(
+			reverse("docgen:document-finalize", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(finalize_response.status_code, 200)
+		document.refresh_from_db()
+		return document
+
+	def test_archive_blocked_until_retention_window(self):
+		document = self._create_finalized_document()
+		archive_response = self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(archive_response.status_code, 400)
+
+	def test_archive_with_force_succeeds(self):
+		document = self._create_finalized_document()
+		archive_response = self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": document.id}),
+			data=json.dumps({"force": True}),
+			content_type="application/json",
+		)
+		self.assertEqual(archive_response.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "ARCHIVED")
+
+	def test_archive_after_retention_window_succeeds(self):
+		document = self._create_finalized_document()
+		document.finalized_at = timezone.now() - timedelta(days=370)
+		document.save(update_fields=["finalized_at", "updated_at"])
+
+		archive_response = self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(archive_response.status_code, 200, archive_response.content.decode())
+		document.refresh_from_db()
+		self.assertEqual(document.status, "ARCHIVED")
+
+	def test_submit_resolves_role_actor_value(self):
+		document = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Actor Resolution",
+		)
+		response = self.client.post(reverse("docgen:document-submit", kwargs={"document_id": document.id}))
+		self.assertEqual(response.status_code, 200)
+		first_stage = document.workflow_stages.order_by("stage_order", "id").first()
+		self.assertTrue(first_stage.actor_value.startswith("role:"))
+
+	def test_parallel_all_requires_all_stage_actions(self):
+		document = self._create_submitted_document()
+		first_stage = document.workflow_stages.filter(stage_order=1).first()
+		first_stage.execution_mode = "PARALLEL_ALL"
+		first_stage.actor_value = "role:reviewer_a"
+		first_stage.save(update_fields=["execution_mode", "actor_value", "updated_at"])
+		DocumentWorkflowStage.objects.create(
+			document=document,
+			stage_order=1,
+			title="Parallel Reviewer B",
+			execution_mode="PARALLEL_ALL",
+			actor_type="ROLE",
+			actor_value="role:reviewer_b",
+			required_action="REVIEW",
+			status="UNDER_REVIEW",
+		)
+
+		active_stages = list(
+			document.workflow_stages.filter(status="UNDER_REVIEW", stage_order=1).order_by("id")
+		)
+		first_review = self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"stage_id": active_stages[0].id, "comment": "A done"}),
+			content_type="application/json",
+		)
+		self.assertEqual(first_review.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "UNDER_REVIEW")
+
+		second_review = self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"stage_id": active_stages[1].id, "comment": "B done"}),
+			content_type="application/json",
+		)
+		self.assertEqual(second_review.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "UNDER_APPROVAL")
+
+	def test_parallel_any_advances_on_first_action(self):
+		document = self._create_submitted_document()
+		first_stage = document.workflow_stages.filter(stage_order=1).first()
+		first_stage.execution_mode = "PARALLEL_ANY"
+		first_stage.actor_value = "role:reviewer_a"
+		first_stage.save(update_fields=["execution_mode", "actor_value", "updated_at"])
+		DocumentWorkflowStage.objects.create(
+			document=document,
+			stage_order=1,
+			title="Parallel Reviewer B",
+			execution_mode="PARALLEL_ANY",
+			actor_type="ROLE",
+			actor_value="role:reviewer_b",
+			required_action="REVIEW",
+			status="UNDER_REVIEW",
+		)
+
+		first_stage = document.workflow_stages.filter(stage_order=1).order_by("id").first()
+		review_response = self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"stage_id": first_stage.id, "comment": "Any one done"}),
+			content_type="application/json",
+		)
+		self.assertEqual(review_response.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "UNDER_APPROVAL")
+		approved_in_first_order = document.workflow_stages.filter(stage_order=1, status="APPROVED").count()
+		self.assertEqual(approved_in_first_order, 2)
+
+	def test_next_stage_order_hook_skips_to_requested_stage(self):
+		template = Template.objects.create(
+			category=self.category,
+			title="Branch Hook Template",
+			code="BRANCH_HOOK_TEMPLATE",
+		)
+		revision = TemplateRevision.objects.create(template=template, version=1, is_published=True)
+		revision.workflow_stages.create(
+			stage_order=1,
+			title="Review 1",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+		)
+		revision.workflow_stages.create(
+			stage_order=2,
+			title="Review 2",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer2",
+			required_action="REVIEW",
+		)
+		revision.workflow_stages.create(
+			stage_order=3,
+			title="Approval",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="approver",
+			required_action="APPROVE",
+		)
+		document = Document.objects.create(
+			template_revision=revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Branch Doc",
+		)
+		self.client.post(reverse("docgen:document-submit", kwargs={"document_id": document.id}))
+
+		review_response = self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"comment": "skip middle", "next_stage_order": 3}),
+			content_type="application/json",
+		)
+		self.assertEqual(review_response.status_code, 200)
+		document.refresh_from_db()
+		self.assertEqual(document.status, "UNDER_APPROVAL")
+		stage2 = document.workflow_stages.filter(stage_order=2).first()
+		self.assertEqual(stage2.status, "DRAFT")
+
+
+class DocGenRbacTests(TestCase):
+	@override_settings(DOCGEN_ENFORCE_RBAC=True)
+	def test_unauthenticated_template_create_forbidden_when_rbac_enabled(self):
+		category = TemplateCategory.objects.create(name="RBAC Category", slug="rbac-category")
+		payload = {
+			"category_id": category.id,
+			"title": "Blocked Template",
+			"code": "BLOCKED_TEMPLATE",
+		}
+		response = self.client.post(
+			reverse("docgen:template-collection"),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 403)
 
 
 class TemplateStructureApiTests(TestCase):

@@ -121,3 +121,9 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# DocGen RBAC rollout flag. Keep disabled until groups/permissions are configured.
+DOCGEN_ENFORCE_RBAC = False
+
+# Archive finalized documents after this many days by default.
+DOCGEN_DEFAULT_ARCHIVE_DAYS = 365
