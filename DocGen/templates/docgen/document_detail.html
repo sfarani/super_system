@@ -35,9 +35,18 @@
   editSubject: '{{ document.subject|escapejs }}',
   editClassification: '{{ document.classification|escapejs }}',
   fieldsData: {{ fields_json }},
+  templateTokens: {{ template_tokens_json }},
+  templateTokensRaw: '',
+  tokenSaving: false,
   saving: false,
   actionSubmitting: false,
   actionError: '',
+
+  init() {
+    this.templateTokensRaw = Object.entries(this.templateTokens || {})
+      .map(([k, v]) => `${k}=${v ?? ''}`)
+      .join('\n');
+  },
 
   get statusColor() {
     const map = {
@@ -76,6 +85,34 @@
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
       body: JSON.stringify({ fields: [{ placeholder_name, value_text: String(value) }] })
     });
+  },
+
+  async saveTemplateTokens() {
+    this.tokenSaving = true;
+    const parsed = {};
+    (this.templateTokensRaw || '').split('\n').forEach(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return;
+      const idx = trimmed.indexOf('=');
+      if (idx < 1) return;
+      const key = trimmed.slice(0, idx).trim();
+      const value = trimmed.slice(idx + 1).trim();
+      if (key) parsed[key] = value;
+    });
+
+    const resp = await fetch('{% url "docgen:document-set-fields" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ fields: [], template_tokens: parsed })
+    });
+    this.tokenSaving = false;
+    if (resp.ok) {
+      this.templateTokens = parsed;
+      alert('Template tokens saved.');
+    } else {
+      const d = await resp.json().catch(() => ({}));
+      alert(d.error || 'Failed to save template tokens.');
+    }
   },
 
   async doAction(action) {
@@ -349,6 +386,39 @@
         </div>
       </div>
       {% endif %}
+
+      <!-- Template Tokens card -->
+      <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold text-slate-700">Template Tokens ([])</h3>
+        </div>
+        <p class="text-xs text-slate-500 mb-3">
+          Provide optional token values used in layout blocks, one per line as
+          <span class="font-mono bg-slate-100 px-1 rounded">name=value</span>.
+          Example: <span class="font-mono bg-slate-100 px-1 rounded">department=Finance Wing</span>
+        </p>
+
+        {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
+          <textarea
+            x-model="templateTokensRaw"
+            rows="8"
+            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-compass-500 outline-none resize-y"
+            placeholder="department=Finance Wing&#10;recipient_title=Director General"></textarea>
+          <button @click="saveTemplateTokens()" :disabled="tokenSaving"
+                  class="mt-3 bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg">
+            <span x-text="tokenSaving ? 'Saving…' : 'Save Tokens'"></span>
+          </button>
+        {% else %}
+          <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+            <template x-if="Object.keys(templateTokens || {}).length === 0">
+              <p class="text-sm text-slate-500">No custom [] token values set.</p>
+            </template>
+            <template x-for="(value, key) in templateTokens" :key="key">
+              <p class="text-sm text-slate-700"><span class="font-mono" x-text="key"></span>=<span x-text="value"></span></p>
+            </template>
+          </div>
+        {% endif %}
+      </div>
 
     </div>
   </div>

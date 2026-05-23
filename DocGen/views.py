@@ -549,6 +549,9 @@ def document_set_fields(request, document_id: int):
 	fields = payload.get("fields", [])
 	if not isinstance(fields, list):
 		return JsonResponse({"error": "fields must be a list."}, status=400)
+	template_tokens_payload = payload.get("template_tokens", None)
+	if template_tokens_payload is not None and not isinstance(template_tokens_payload, dict):
+		return JsonResponse({"error": "template_tokens must be a JSON object."}, status=400)
 
 	updated = 0
 	updated_names = []
@@ -566,6 +569,23 @@ def document_set_fields(request, document_id: int):
 		updated += 1
 		updated_names.append(placeholder_name)
 
+	updated_token_count = None
+	if template_tokens_payload is not None:
+		normalized_tokens = {}
+		for key, value in template_tokens_payload.items():
+			if not isinstance(key, str):
+				continue
+			normalized_key = key.strip()
+			if not normalized_key:
+				continue
+			normalized_tokens[normalized_key] = "" if value is None else str(value)
+
+		metadata = document.metadata if isinstance(document.metadata, dict) else {}
+		metadata["template_tokens"] = normalized_tokens
+		document.metadata = metadata
+		document.save(update_fields=["metadata", "updated_at"])
+		updated_token_count = len(normalized_tokens)
+
 	emit_notification_event(
 		event_type="docgen.document.set_fields",
 		payload={
@@ -574,12 +594,16 @@ def document_set_fields(request, document_id: int):
 			"status": document.status,
 			"updated_fields": updated,
 			"placeholder_names": updated_names,
+			"template_tokens_updated": updated_token_count,
 			"actor": request.user.username if request.user.is_authenticated else None,
 			"timestamp": timezone.now().isoformat(),
 		},
 	)
 
-	return JsonResponse({"document_id": document.id, "updated_fields": updated})
+	response_payload = {"document_id": document.id, "updated_fields": updated}
+	if updated_token_count is not None:
+		response_payload["template_tokens_updated"] = updated_token_count
+	return JsonResponse(response_payload)
 
 
 @require_http_methods(["POST"])

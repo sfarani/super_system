@@ -4,6 +4,7 @@ import base64
 from io import BytesIO
 import hashlib
 import json
+import re
 
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -20,6 +21,165 @@ from .models import Document, DocumentPDF, DocumentStatus, DocumentWorkflowStage
 from .notifications import LocalNotificationAdapter
 
 
+_TOKEN_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+_BRACKET_TOKEN_RE = re.compile(r"\[(\w+)\]")
+
+
+def _coerce_text_value(value_text, value_json) -> str:
+    if value_text not in [None, ""]:
+        return str(value_text)
+    if value_json in [None, "", {}]:
+        return ""
+    return json.dumps(value_json, ensure_ascii=True)
+
+
+def _build_render_context(document: Document, field_map: dict[str, str]) -> dict[str, str]:
+    now_local = timezone.localtime(timezone.now())
+    submitted_at = timezone.localtime(document.submitted_at).strftime("%d %b %Y") if document.submitted_at else ""
+    approved_at = timezone.localtime(document.approved_at).strftime("%d %b %Y") if document.approved_at else ""
+    metadata = document.metadata if isinstance(document.metadata, dict) else {}
+    custom_tokens = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
+
+    context = {
+        "reference_number": document.reference_number or "",
+        "date": now_local.strftime("%d %b %Y"),
+        "title": document.title or "",
+        "subject": document.subject or "",
+        "document_type": str(document.document_type or ""),
+        "status": str(document.status or ""),
+        "originator": document.originator.username if document.originator else "",
+        "submitted_date": submitted_at,
+        "approval_date": approved_at,
+    }
+    context.update({str(k): "" if v is None else str(v) for k, v in custom_tokens.items() if str(k).strip()})
+    context.update(field_map)
+    return context
+
+
+def _extract_layout_tokens(layout_schema: dict) -> set[str]:
+    blocks = layout_schema.get("blocks") if isinstance(layout_schema, dict) else None
+    if not isinstance(blocks, list):
+        return set()
+
+    tokens: set[str] = set()
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        content = str(block.get("content") or "")
+        tokens.update(match.group(1) for match in _TOKEN_RE.finditer(content))
+        tokens.update(match.group(1) for match in _BRACKET_TOKEN_RE.finditer(content))
+    return tokens
+
+
+def _find_missing_required_placeholders(document: Document, field_map: dict[str, str]) -> list[str]:
+    required_names = list(
+        document.template_revision.placeholders.filter(is_required=True).values_list("name", flat=True)
+    )
+    return sorted(name for name in required_names if not str(field_map.get(name, "")).strip())
+
+
+def _build_preview_diagnostics_html(missing_required: list[str], unresolved_tokens: list[str]) -> str:
+    if not missing_required and not unresolved_tokens:
+        return ""
+
+    details: list[str] = []
+    if missing_required:
+        details.append(
+            "<div><strong>Missing required fields:</strong> "
+            + escape(", ".join(missing_required))
+            + "</div>"
+        )
+    if unresolved_tokens:
+        details.append(
+            "<div><strong>Unresolved tokens in layout:</strong> "
+            + escape(", ".join(unresolved_tokens))
+            + "</div>"
+        )
+
+    return (
+        "<div style='border:1px solid #f59e0b;background:#fffbeb;color:#92400e;"
+        "padding:8px 10px;margin-bottom:12px;font-size:9pt;line-height:1.4;'>"
+        "<div style='font-weight:700;margin-bottom:4px;'>Preview Warnings</div>"
+        + "".join(details)
+        + "</div>"
+    )
+
+
+def _render_template_tokens(raw: str, render_context: dict[str, str]) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token in render_context:
+            return render_context[token]
+        return match.group(0)
+
+    rendered = _TOKEN_RE.sub(_replace, raw or "")
+    # Support builder defaults like [reference_number] and [date].
+    return _BRACKET_TOKEN_RE.sub(_replace, rendered)
+
+
+def _build_layout_blocks_html(document: Document, render_context: dict[str, str]) -> str:
+    layout = document.template_revision.layout_schema or {}
+    blocks = layout.get("blocks") if isinstance(layout, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return ""
+
+    parts: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "custom")
+        align = str(block.get("align") or "left")
+        content = _render_template_tokens(str(block.get("content") or ""), render_context)
+        content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+
+        style = "margin-bottom:10px;white-space:normal;"
+        if align in {"left", "center", "right"}:
+            style += f"text-align:{align};"
+        if block_type == "letterhead":
+            style += "font-weight:700;font-size:13pt;line-height:1.35;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:16px;"
+        elif block_type == "reference_line":
+            style += "font-size:10pt;color:#333;margin-bottom:8px;"
+        elif block_type == "subject_line":
+            style += "font-weight:700;text-decoration:underline;margin-top:10px;margin-bottom:12px;"
+        elif block_type == "salutation":
+            style += "margin-top:8px;margin-bottom:10px;"
+        elif block_type == "body":
+            style += "line-height:1.65;text-align:justify;margin-bottom:12px;"
+        elif block_type == "closing":
+            style += "margin-top:14px;margin-bottom:8px;"
+        elif block_type == "signature_block":
+            style += "margin-top:26px;line-height:1.4;"
+        elif block_type == "footer":
+            style += "font-size:9pt;color:#555;border-top:1px solid #ccc;padding-top:6px;margin-top:20px;"
+
+        parts.append(f"<div style='{style}'>{content_html}</div>")
+
+    return "".join(parts)
+
+
+def _resolve_page_setup(document: Document) -> tuple[str, str, int, int, int, int]:
+    layout = document.template_revision.layout_schema or {}
+    page = layout.get("page") if isinstance(layout, dict) else {}
+    if not isinstance(page, dict):
+        page = {}
+
+    def _int_or(default: int, value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    paper_size = str(page.get("paper_size") or "A4")
+    orientation = str(page.get("orientation") or "portrait")
+    margin_top = _int_or(20, page.get("margin_top"))
+    margin_bottom = _int_or(20, page.get("margin_bottom"))
+    margin_left = _int_or(25, page.get("margin_left"))
+    margin_right = _int_or(25, page.get("margin_right"))
+    if orientation not in {"portrait", "landscape"}:
+        orientation = "portrait"
+    return paper_size, orientation, margin_top, margin_right, margin_bottom, margin_left
+
+
 def _generate_qr_data_uri(data: str) -> str | None:
     """Return a base64 PNG data URI for a QR code, or None if qrcode is not installed."""
     try:
@@ -34,7 +194,42 @@ def _generate_qr_data_uri(data: str) -> str | None:
     return f"data:image/png;base64,{encoded}"
 
 
-def _build_pdf_html(document: Document) -> str:
+def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> str:
+    field_map = {
+        field.placeholder_name: _coerce_text_value(field.value_text, field.value_json)
+        for field in document.fields.order_by("placeholder_name")
+    }
+    render_context = _build_render_context(document, field_map)
+
+    layout_body = _build_layout_blocks_html(document, render_context)
+    paper_size, orientation, margin_top, margin_right, margin_bottom, margin_left = _resolve_page_setup(document)
+    diagnostics_html = ""
+
+    if include_diagnostics:
+        layout_schema = document.template_revision.layout_schema or {}
+        layout_tokens = _extract_layout_tokens(layout_schema if isinstance(layout_schema, dict) else {})
+        unresolved_tokens = sorted(token for token in layout_tokens if token not in render_context)
+        missing_required = _find_missing_required_placeholders(document, field_map)
+        diagnostics_html = _build_preview_diagnostics_html(missing_required, unresolved_tokens)
+
+    if layout_body:
+        return f"""
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset=\"utf-8\" />
+        <style>
+            @page {{ size: {escape(paper_size)} {escape(orientation)}; margin: {margin_top}mm {margin_right}mm {margin_bottom}mm {margin_left}mm; }}
+            body {{ margin: 0; font-family: Helvetica, Arial, sans-serif; font-size: 11pt; color: #111; line-height: 1.5; }}
+        </style>
+    </head>
+    <body>
+        {diagnostics_html}
+        {layout_body}
+    </body>
+</html>
+""".strip()
+
     fields = [
         {
             "placeholder_name": field.placeholder_name,
@@ -178,7 +373,7 @@ def generate_pdf_preview(document: Document) -> bytes:
 
 def _build_pdf_preview_html(document: Document) -> str:
     """Same as _build_pdf_html but injects a DRAFT watermark style."""
-    base = _build_pdf_html(document)
+    base = _build_pdf_html(document, include_diagnostics=True)
     watermark_style = (
         "<style>"
         "body::before {"

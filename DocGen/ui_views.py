@@ -225,6 +225,9 @@ def document_detail_ui(request, document_id: int):
         for f in document.fields.all()
     }
     fields_json = json.dumps(fields_map)
+    metadata = document.metadata if isinstance(document.metadata, dict) else {}
+    template_tokens_map = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
+    template_tokens_json = json.dumps(template_tokens_map)
 
     # Workflow stages
     workflow_stages = list(
@@ -313,6 +316,7 @@ def document_detail_ui(request, document_id: int):
         "document": document,
         "placeholders": placeholders,
         "fields_json": fields_json,
+        "template_tokens_json": template_tokens_json,
         "workflow_stages": wf_data,
         "timeline_events": timeline_events,
         "comments_json": comments_json,
