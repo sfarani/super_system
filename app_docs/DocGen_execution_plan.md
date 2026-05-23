@@ -26,7 +26,7 @@ Exit Criteria:
 - Verify endpoint returns valid/revoked/not-found states.
 
 Status:
-- In progress (implemented in code, pending environment setup for migration/test execution).
+- Completed (models, admin, URLs, migrations, and verification endpoint implemented and tested).
 
 ## Phase 1 - Template Builder Backend
 Duration: 3-5 days
@@ -47,6 +47,9 @@ Exit Criteria:
 - New edits always create a new revision.
 - Placeholder uniqueness and field type constraints enforced.
 
+Status:
+- In progress (template lifecycle APIs, publish/retire/clone flow, and tests implemented).
+
 ## Phase 2 - Document Composer and Lifecycle
 Duration: 4-6 days
 
@@ -65,6 +68,9 @@ Exit Criteria:
 - DRAFT to SUBMITTED path stable.
 - Invalid transitions blocked and audited.
 - Snapshots created for key lifecycle changes.
+
+Status:
+- In progress (document create API, field capture API, submit API, workflow stage instantiation, and submission snapshot tests implemented).
 
 ## Phase 3 - Review and Approval Engine
 Duration: 5-7 days
@@ -155,11 +161,11 @@ Exit Criteria:
 - Reporting endpoints provide actionable metrics.
 
 ## Immediate Next Sprint Tasks
-1. Set up Python environment and install dependencies (Django, DRF, pytest or Django test usage).
-2. Run migrations and fix any migration-level issues.
-3. Introduce DRF serializers and viewsets for Template and Document.
-4. Add lifecycle transition service and tests.
-5. Add publish-template workflow endpoint and immutability enforcement.
+1. Complete Phase 1 by adding placeholder and workflow-stage CRUD APIs for draft revisions.
+2. Extend Phase 2 with return/reject/approve transition actions and policy checks.
+3. Add guarded transition audit hooks and actor tracking for workflow actions.
+4. Add initial API documentation in app_docs for template and document endpoints.
+5. Prepare Phase 3 workflow action endpoints (review, approve, return, reject, delegate, clarify).
 
 ## Definition of Done per Phase
 - Code implemented with tests.
