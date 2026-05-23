@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**Super System** is my playground to test my ideas for the COMPASS.
+**Super System** is my playground to test my ideas for the COMPASS. COMPASS (Comprehensive Organizational Management & Process Automation System) is a Django-based platform for PNRA (Pakistan Nuclear Regulatory Authority) managing employees, documents, training, competency analysis, and workflow automation. COMPASS has the following tech stack and core apps:
 
 **Tech Stack**: Django 5.2 · Python 3.x · Celery/Redis · SQLite (dev) / PostgreSQL / MySQL (prod) · Docker
 
