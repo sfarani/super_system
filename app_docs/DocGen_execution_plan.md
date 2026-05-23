@@ -70,7 +70,7 @@ Exit Criteria:
 - Snapshots created for key lifecycle changes.
 
 Status:
-- In progress (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, request clarification action, feature-flagged RBAC scaffolding, document finalization endpoint with QR issuance, PDF artifact stub/hash persistence, parallel all/any execution policies, conditional next-stage hook, actor-resolution adapter hook, archive transition with retention guard, and tests implemented).
+- In progress (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, request clarification action, feature-flagged RBAC scaffolding, document finalization endpoint with QR issuance, real HTML-to-PDF artifact persistence, parallel all/any execution policies, conditional next-stage hook, actor-resolution adapter hook, archive transition with retention guard, notification adapter hooks, and tests implemented).
 
 ## Phase 3 - Review and Approval Engine
 Duration: 5-7 days
@@ -107,7 +107,7 @@ Deliverables:
 
 Exit Criteria:
 - Finalized documents generate signed verifiable PDFs.
-- Verification endpoint distinguishes valid/revoked/superseded.
+- Verification endpoint distinguishes valid/revoked/superseded/tampered.
 - Hash integrity data persisted.
 
 ## Phase 5 - Security, Permissions, and Audit
@@ -140,6 +140,9 @@ Deliverables:
 - Event payload schema and emitters.
 - Integration tests (mocked adapters).
 
+Status:
+- In progress (SLA task hooks + notification adapter emitters implemented; mocked integration tests added for COMPASS actor-resolution HTTP adapter and notification HTTP adapter).
+
 Exit Criteria:
 - Heavy jobs are asynchronous with retries.
 - Notification and escalation events emitted reliably.
@@ -165,7 +168,7 @@ Exit Criteria:
 2. Replace PDF stub generation with real HTML-to-PDF rendering pipeline and storage adapters. (Completed)
 3. Implement actor-resolution adapters against COMPASS directory/org-chart services. (Completed)
 4. Add archive listing/query APIs and retention-policy admin controls. (Completed)
-5. Defer SLA reminder/escalation Celery tasks to COMPASS integration stage (as agreed).
+5. Defer SLA reminder/escalation Celery tasks to COMPASS integration stage (as agreed). (Implemented early with adapter-ready notification hooks)
 
 ## Definition of Done per Phase
 - Code implemented with tests.

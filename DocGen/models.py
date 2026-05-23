@@ -474,6 +474,9 @@ class DocumentWorkflowStage(TimeStampedModel):
 	)
 	acted_at = models.DateTimeField(null=True, blank=True)
 	due_at = models.DateTimeField(null=True, blank=True)
+	reminder_sent_at = models.DateTimeField(null=True, blank=True)
+	escalated_at = models.DateTimeField(null=True, blank=True)
+	escalation_level = models.PositiveIntegerField(default=0)
 	comments = models.TextField(blank=True)
 
 	class Meta:

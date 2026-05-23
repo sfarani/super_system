@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from django.conf import settings as django_settings
 from django.core import signing
+from django.core.signing import BadSignature
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from django.db.models import Q
@@ -31,7 +32,7 @@ from .models import (
 	TemplateStatus,
 	TemplateWorkflowStage,
 )
-from .services import generate_pdf_artifact, resolve_workflow_actor
+from .services import emit_notification_event, generate_pdf_artifact, resolve_workflow_actor
 
 
 _DOCGEN_PERMISSION_PREFIX = f"{Template._meta.app_label}."
@@ -83,6 +84,7 @@ def _snapshot_document(document: Document, actor=None):
 
 
 def _append_document_event(document: Document, action: str, actor, comment: str = ""):
+	event_timestamp = timezone.now().isoformat()
 	metadata = document.metadata or {}
 	events = metadata.get("events", [])
 	events.append(
@@ -90,11 +92,38 @@ def _append_document_event(document: Document, action: str, actor, comment: str 
 			"action": action,
 			"actor": actor.username if actor else None,
 			"comment": comment,
-			"timestamp": timezone.now().isoformat(),
+			"timestamp": event_timestamp,
 		}
 	)
 	metadata["events"] = events
 	document.metadata = metadata
+	emit_notification_event(
+		event_type=f"docgen.document.{action}",
+		payload={
+			"document_id": document.id,
+			"reference_number": document.reference_number,
+			"document_type": document.document_type,
+			"status": document.status,
+			"action": action,
+			"actor": actor.username if actor else None,
+			"comment": comment,
+			"timestamp": event_timestamp,
+		},
+	)
+
+
+def _emit_template_event(action: str, template: Template, actor=None, extra_payload=None):
+	payload = {
+		"template_id": template.id,
+		"code": template.code,
+		"title": template.title,
+		"status": template.status,
+		"actor": actor.username if actor else None,
+		"timestamp": timezone.now().isoformat(),
+	}
+	if extra_payload:
+		payload.update(extra_payload)
+	emit_notification_event(event_type=f"docgen.template.{action}", payload=payload)
 
 
 def _ensure_revision_editable(revision: TemplateRevision):
@@ -272,6 +301,32 @@ def verify_token(request, token: str):
 	except DocumentQRToken.DoesNotExist:
 		return JsonResponse({"valid": False, "reason": "token_not_found"}, status=404)
 
+	try:
+		signing.loads(qr.signed_payload, salt="docgen-verify")
+	except BadSignature:
+		return JsonResponse(
+			{
+				"valid": False,
+				"status": "tampered",
+				"reason": "token_tampered",
+			},
+			status=400,
+		)
+
+	superseded_by = qr.document.superseded_by_documents.order_by("-created_at").first()
+	if superseded_by is not None:
+		return JsonResponse(
+			{
+				"valid": False,
+				"status": "superseded",
+				"reason": "document_superseded",
+				"reference_number": qr.document.reference_number,
+				"document_type": qr.document.document_type,
+				"finalized_at": qr.document.finalized_at,
+				"superseded_by": superseded_by.reference_number,
+			}
+		)
+
 	status = "revoked" if qr.is_revoked else "valid"
 	payload = {
 		"valid": not qr.is_revoked,
@@ -349,6 +404,13 @@ def template_collection(request):
 	except ValidationError as error:
 		return JsonResponse({"error": str(error)}, status=400)
 
+	_emit_template_event(
+		action="create",
+		template=template,
+		actor=request.user if request.user.is_authenticated else None,
+		extra_payload={"revision": revision.version},
+	)
+
 	return JsonResponse(
 		{
 			"id": template.id,
@@ -359,6 +421,8 @@ def template_collection(request):
 		},
 		status=201,
 	)
+
+
 
 
 @require_http_methods(["POST"])
@@ -372,6 +436,12 @@ def template_clone_revision(request, template_id: int):
 
 	template = get_object_or_404(Template, pk=template_id)
 	new_revision = template.create_next_revision(created_by=request.user if request.user.is_authenticated else None)
+	_emit_template_event(
+		action="clone_revision",
+		template=template,
+		actor=request.user if request.user.is_authenticated else None,
+		extra_payload={"new_revision": new_revision.version},
+	)
 	return JsonResponse(
 		{
 			"template_id": template.id,
@@ -413,6 +483,13 @@ def template_publish(request, template_id: int):
 	except ValidationError as error:
 		return JsonResponse({"error": str(error)}, status=400)
 
+	_emit_template_event(
+		action="publish",
+		template=template,
+		actor=request.user if request.user.is_authenticated else None,
+		extra_payload={"published_revision": revision.version},
+	)
+
 	return JsonResponse(
 		{
 			"template_id": template.id,
@@ -435,6 +512,11 @@ def template_retire(request, template_id: int):
 	template.status = TemplateStatus.RETIRED
 	template.is_locked = True
 	template.save(update_fields=["status", "is_locked", "updated_at"])
+	_emit_template_event(
+		action="retire",
+		template=template,
+		actor=request.user if request.user.is_authenticated else None,
+	)
 	return JsonResponse(
 		{
 			"template_id": template.id,
@@ -491,6 +573,19 @@ def document_collection(request):
 		subject=subject,
 		originator=request.user if request.user.is_authenticated else None,
 	)
+	emit_notification_event(
+		event_type="docgen.document.create",
+		payload={
+			"document_id": document.id,
+			"document_type": document.document_type,
+			"status": document.status,
+			"title": document.title,
+			"subject": document.subject,
+			"template_revision": document.template_revision.version,
+			"actor": request.user.username if request.user.is_authenticated else None,
+			"timestamp": timezone.now().isoformat(),
+		},
+	)
 
 	return JsonResponse(
 		{
@@ -525,6 +620,7 @@ def document_set_fields(request, document_id: int):
 		return JsonResponse({"error": "fields must be a list."}, status=400)
 
 	updated = 0
+	updated_names = []
 	for item in fields:
 		placeholder_name = item.get("placeholder_name")
 		if not placeholder_name:
@@ -537,6 +633,20 @@ def document_set_fields(request, document_id: int):
 			defaults={"value_text": value_text, "value_json": value_json},
 		)
 		updated += 1
+		updated_names.append(placeholder_name)
+
+	emit_notification_event(
+		event_type="docgen.document.set_fields",
+		payload={
+			"document_id": document.id,
+			"reference_number": document.reference_number,
+			"status": document.status,
+			"updated_fields": updated,
+			"placeholder_names": updated_names,
+			"actor": request.user.username if request.user.is_authenticated else None,
+			"timestamp": timezone.now().isoformat(),
+		},
+	)
 
 	return JsonResponse({"document_id": document.id, "updated_fields": updated})
 

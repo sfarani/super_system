@@ -78,7 +78,18 @@ class DocumentRevisionAdmin(admin.ModelAdmin):
 
 @admin.register(DocumentWorkflowStage)
 class DocumentWorkflowStageAdmin(admin.ModelAdmin):
-	list_display = ("document", "stage_order", "title", "required_action", "status", "acted_by", "acted_at")
+	list_display = (
+		"document",
+		"stage_order",
+		"title",
+		"required_action",
+		"status",
+		"acted_by",
+		"acted_at",
+		"reminder_sent_at",
+		"escalation_level",
+		"escalated_at",
+	)
 	list_filter = ("required_action", "status", "actor_type")
 
 

@@ -10,7 +10,45 @@ Base prefix: /compass/docgen/
 
 - GET /verify/{token}/
   - Purpose: QR verification lookup
-  - Response: valid/status/reference_number/document_type/finalized_at
+  - Response behavior:
+    - 200 valid:
+      {
+        "valid": true,
+        "status": "valid",
+        "reference_number": "...",
+        "document_type": "...",
+        "finalized_at": "..."
+      }
+    - 200 revoked:
+      {
+        "valid": false,
+        "status": "revoked",
+        "reference_number": "...",
+        "document_type": "...",
+        "finalized_at": "...",
+        "revoked_reason": "..."
+      }
+    - 200 superseded:
+      {
+        "valid": false,
+        "status": "superseded",
+        "reason": "document_superseded",
+        "reference_number": "...",
+        "document_type": "...",
+        "finalized_at": "...",
+        "superseded_by": "..."
+      }
+    - 400 tampered token payload signature:
+      {
+        "valid": false,
+        "status": "tampered",
+        "reason": "token_tampered"
+      }
+    - 404 unknown token:
+      {
+        "valid": false,
+        "reason": "token_not_found"
+      }
 
 ## Template APIs
 
@@ -279,3 +317,68 @@ Base prefix: /compass/docgen/
   - DOCGEN_COMPASS_ORGCHART_MANAGER_URL
   - DOCGEN_COMPASS_API_TIMEOUT_SECONDS
   - DOCGEN_COMPASS_API_TOKEN
+
+## SLA Reminder and Escalation Processing
+
+- Service: DocGen.services.process_sla_events()
+- Task hook: DocGen.tasks.process_sla_events_task
+- Management command: python manage.py docgen_process_sla
+  - Output counters: checked, reminders_sent, escalations_sent, notifications_sent, notification_failures
+
+- Trigger behavior (for active UNDER_REVIEW / UNDER_APPROVAL stages with due_at):
+  - Reminder event (action=sla_reminder)
+    - Fired once when current time is within reminder window before due_at.
+    - Stage field updated: reminder_sent_at
+  - Escalation event (action=sla_escalation)
+    - Fired once when stage is overdue past escalation threshold.
+    - Stage fields updated: escalated_at, escalation_level
+
+- Settings:
+  - DOCGEN_SLA_REMINDER_MINUTES_BEFORE_DUE (default 60)
+  - DOCGEN_SLA_ESCALATION_MINUTES_AFTER_DUE (default 120)
+
+## Notification Bus Adapter
+
+- Notification publishing is adapter-driven.
+- Setting: DOCGEN_NOTIFICATION_ADAPTER
+  - Default: DocGen.notifications.LocalNotificationAdapter
+
+- Built-in adapters:
+  - DocGen.notifications.LocalNotificationAdapter
+    - No-op local adapter (always success) for dev/test bootstrap.
+  - DocGen.notifications.HttpNotificationAdapter
+    - Sends POST JSON events to configured endpoint.
+
+- HTTP adapter settings:
+  - DOCGEN_NOTIFICATION_HTTP_ENDPOINT
+  - DOCGEN_NOTIFICATION_TIMEOUT_SECONDS
+  - DOCGEN_NOTIFICATION_API_TOKEN
+
+- Current emitted SLA event types:
+  - docgen.stage.sla_reminder
+  - docgen.stage.sla_escalation
+
+- Current emitted document lifecycle/workflow event types:
+  - docgen.document.create
+  - docgen.document.set_fields
+  - docgen.document.submit
+  - docgen.document.review
+  - docgen.document.endorse
+  - docgen.document.approve
+  - docgen.document.approve_with_comments
+  - docgen.document.request_clarification
+  - docgen.document.return
+  - docgen.document.reject
+  - docgen.document.delegate
+  - docgen.document.finalize
+  - docgen.document.archive
+
+- Current emitted template lifecycle event types:
+  - docgen.template.create
+  - docgen.template.clone_revision
+  - docgen.template.publish
+  - docgen.template.retire
+
+- Integration-test coverage:
+  - Mocked COMPASS actor-resolution adapter HTTP calls (success + fallback)
+  - Mocked notification HTTP adapter publish calls (success + failure)

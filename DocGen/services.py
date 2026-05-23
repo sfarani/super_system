@@ -7,13 +7,16 @@ import json
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 from django.utils.html import escape
 from django.utils.module_loading import import_string
+from datetime import timedelta
 from xhtml2pdf import pisa
 
 from .adapters import LocalActorResolutionAdapter
-from .models import Document, DocumentPDF
+from .models import Document, DocumentPDF, DocumentStatus, DocumentWorkflowStage
+from .notifications import LocalNotificationAdapter
 
 
 def _build_pdf_html(document: Document) -> str:
@@ -152,3 +155,140 @@ def resolve_workflow_actor(actor_type: str, actor_value: str, document: Document
     if isinstance(resolved, str) and resolved:
         return resolved
     return LocalActorResolutionAdapter().resolve(actor_type=actor_type, actor_value=actor_value, document=document)
+
+
+def _get_notification_adapter():
+    adapter_path = getattr(
+        settings,
+        "DOCGEN_NOTIFICATION_ADAPTER",
+        "DocGen.notifications.LocalNotificationAdapter",
+    )
+    try:
+        adapter_cls = import_string(adapter_path)
+        adapter = adapter_cls()
+    except Exception:
+        adapter = LocalNotificationAdapter()
+
+    if not hasattr(adapter, "publish"):
+        return LocalNotificationAdapter()
+    return adapter
+
+
+def emit_notification_event(event_type: str, payload: dict) -> bool:
+    adapter = _get_notification_adapter()
+    try:
+        return bool(adapter.publish(event_type=event_type, payload=payload))
+    except Exception:
+        return False
+
+
+def _append_system_event(document: Document, action: str, comment: str, now=None):
+    current_time = now or timezone.now()
+    metadata = document.metadata or {}
+    events = metadata.get("events", [])
+    events.append(
+        {
+            "action": action,
+            "actor": None,
+            "comment": comment,
+            "timestamp": current_time.isoformat(),
+        }
+    )
+    metadata["events"] = events
+    document.metadata = metadata
+
+
+def process_sla_events(now=None) -> dict[str, int]:
+    current_time = now or timezone.now()
+    reminder_minutes = int(getattr(settings, "DOCGEN_SLA_REMINDER_MINUTES_BEFORE_DUE", 60))
+    escalation_minutes = int(getattr(settings, "DOCGEN_SLA_ESCALATION_MINUTES_AFTER_DUE", 120))
+
+    reminder_cutoff_delta = timedelta(minutes=max(0, reminder_minutes))
+    escalation_cutoff_delta = timedelta(minutes=max(0, escalation_minutes))
+
+    active_stages = DocumentWorkflowStage.objects.select_related("document").filter(
+        status__in=[DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL],
+        due_at__isnull=False,
+    )
+
+    reminders_sent = 0
+    escalations_sent = 0
+    notifications_sent = 0
+    notification_failures = 0
+
+    for stage in active_stages:
+        due_at = stage.due_at
+        if due_at is None:
+            continue
+
+        document_updated = False
+        stage_updated_fields = []
+
+        if stage.reminder_sent_at is None:
+            reminder_start = due_at - reminder_cutoff_delta
+            if reminder_start <= current_time < due_at:
+                reminder_payload = {
+                    "document_id": stage.document_id,
+                    "reference_number": stage.document.reference_number,
+                    "stage_id": stage.id,
+                    "stage_order": stage.stage_order,
+                    "required_action": stage.required_action,
+                    "actor_value": stage.actor_value,
+                    "due_at": due_at.isoformat(),
+                }
+                _append_system_event(
+                    stage.document,
+                    action="sla_reminder",
+                    comment=f"Stage {stage.id} due at {due_at.isoformat()}",
+                    now=current_time,
+                )
+                if emit_notification_event("docgen.stage.sla_reminder", reminder_payload):
+                    notifications_sent += 1
+                else:
+                    notification_failures += 1
+                stage.reminder_sent_at = current_time
+                stage_updated_fields.extend(["reminder_sent_at", "updated_at"])
+                reminders_sent += 1
+                document_updated = True
+
+        if stage.escalated_at is None and current_time >= (due_at + escalation_cutoff_delta):
+            escalation_payload = {
+                "document_id": stage.document_id,
+                "reference_number": stage.document.reference_number,
+                "stage_id": stage.id,
+                "stage_order": stage.stage_order,
+                "required_action": stage.required_action,
+                "actor_value": stage.actor_value,
+                "due_at": due_at.isoformat(),
+                "overdue_minutes": int((current_time - due_at).total_seconds() // 60),
+            }
+            _append_system_event(
+                stage.document,
+                action="sla_escalation",
+                comment=f"Stage {stage.id} overdue since {due_at.isoformat()}",
+                now=current_time,
+            )
+            if emit_notification_event("docgen.stage.sla_escalation", escalation_payload):
+                notifications_sent += 1
+            else:
+                notification_failures += 1
+            stage.escalated_at = current_time
+            stage.escalation_level = (stage.escalation_level or 0) + 1
+            if "updated_at" not in stage_updated_fields:
+                stage_updated_fields.append("updated_at")
+            stage_updated_fields.extend(["escalated_at", "escalation_level"])
+            escalations_sent += 1
+            document_updated = True
+
+        if document_updated:
+            with transaction.atomic():
+                stage.document.save(update_fields=["metadata", "updated_at"])
+                stage.save(update_fields=list(dict.fromkeys(stage_updated_fields)))
+
+    return {
+        "checked": active_stages.count(),
+        "reminders_sent": reminders_sent,
+        "escalations_sent": escalations_sent,
+        "notifications_sent": notifications_sent,
+        "notification_failures": notification_failures,
+    }

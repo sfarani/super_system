@@ -2,6 +2,7 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.core import signing
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.test.utils import override_settings
@@ -10,10 +11,13 @@ import json
 from unittest.mock import patch
 
 from .adapters import CompassActorResolutionAdapter
+from .notifications import HttpNotificationAdapter
+from .services import process_sla_events
 from .models import (
 	Document,
 	DocumentQRToken,
 	DocumentType,
+	DocumentStatus,
 	DocumentWorkflowStage,
 	RetentionPolicy,
 	Template,
@@ -26,6 +30,20 @@ from .models import (
 class CustomActorResolutionAdapter:
 	def resolve(self, actor_type: str, actor_value: str, document) -> str:
 		return f"custom:{actor_type.lower()}:{actor_value}"
+
+
+class CapturingNotificationAdapter:
+	events = []
+
+	def publish(self, event_type: str, payload: dict) -> bool:
+		self.__class__.events.append((event_type, payload))
+		return True
+
+
+class FailingNotificationAdapter:
+	def publish(self, event_type: str, payload: dict) -> bool:
+		_ = (event_type, payload)
+		return False
 
 
 class DocGenModelTests(TestCase):
@@ -70,13 +88,13 @@ class DocGenViewTests(TestCase):
 			title="Memo Template",
 			code="MEMO_TEMPLATE",
 		)
-		revision = TemplateRevision.objects.create(
+		self.revision = TemplateRevision.objects.create(
 			template=template,
 			version=1,
 			is_published=True,
 		)
 		self.document = Document.objects.create(
-			template_revision=revision,
+			template_revision=self.revision,
 			document_type=DocumentType.MEMORANDUM,
 			title="Memo Doc",
 			reference_number="COMPASS/HQ/MEM/2026/00001",
@@ -84,7 +102,11 @@ class DocGenViewTests(TestCase):
 		)
 
 	def test_verify_endpoint_returns_valid_document(self):
-		token = DocumentQRToken.objects.create(document=self.document, token="abc123")
+		token = DocumentQRToken.objects.create(
+			document=self.document,
+			token="abc123",
+			signed_payload=signing.dumps({"reference_number": self.document.reference_number}, salt="docgen-verify"),
+		)
 		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": token.token}))
 
 		self.assertEqual(response.status_code, 200)
@@ -95,6 +117,56 @@ class DocGenViewTests(TestCase):
 	def test_verify_endpoint_returns_not_found_for_unknown_token(self):
 		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": "not-found"}))
 		self.assertEqual(response.status_code, 404)
+
+	def test_verify_endpoint_returns_revoked_status(self):
+		token = DocumentQRToken.objects.create(
+			document=self.document,
+			token="revoked-token",
+			signed_payload=signing.dumps({"reference_number": self.document.reference_number}, salt="docgen-verify"),
+			is_revoked=True,
+			revoked_reason="Invalidated by admin",
+		)
+		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": token.token}))
+		self.assertEqual(response.status_code, 200)
+		self.assertFalse(response.json()["valid"])
+		self.assertEqual(response.json()["status"], "revoked")
+
+	def test_verify_endpoint_detects_tampered_token_payload(self):
+		token = DocumentQRToken.objects.create(
+			document=self.document,
+			token="tampered-token",
+			signed_payload="definitely-not-a-valid-signature",
+		)
+		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": token.token}))
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json()["status"], "tampered")
+
+	def test_verify_endpoint_returns_superseded_status(self):
+		token = DocumentQRToken.objects.create(
+			document=self.document,
+			token="superseded-token",
+			signed_payload="e30=",
+		)
+		token.signed_payload = signing.dumps({"reference_number": self.document.reference_number}, salt="docgen-verify")
+		token.save(update_fields=["signed_payload", "updated_at"])
+
+		superseding = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Superseding Memo",
+			reference_number="COMPASS/HQ/MEM/2026/00002",
+			status=DocumentStatus.FINALIZED,
+			finalized_at=timezone.now(),
+			supersedes=self.document,
+		)
+		self.assertEqual(superseding.supersedes_id, self.document.id)
+
+		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": token.token}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertFalse(data["valid"])
+		self.assertEqual(data["status"], "superseded")
+		self.assertEqual(data["superseded_by"], superseding.reference_number)
 
 
 class TemplateLifecycleTests(TestCase):
@@ -218,6 +290,38 @@ class TemplateApiTests(TestCase):
 		self.assertEqual(template.status, "RETIRED")
 		self.assertTrue(template.is_locked)
 
+	@override_settings(DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.CapturingNotificationAdapter")
+	def test_template_lifecycle_emits_notification_events(self):
+		CapturingNotificationAdapter.events = []
+		create_payload = {
+			"category_id": self.category.id,
+			"title": "Notified Template",
+			"code": "NOTIFIED_TEMPLATE",
+			"layout_schema": {"blocks": [{"type": "body"}]},
+		}
+		create_response = self.client.post(
+			reverse("docgen:template-collection"),
+			data=json.dumps(create_payload),
+			content_type="application/json",
+		)
+		self.assertEqual(create_response.status_code, 201)
+		template_id = create_response.json()["id"]
+
+		clone_response = self.client.post(reverse("docgen:template-clone-revision", kwargs={"template_id": template_id}))
+		self.assertEqual(clone_response.status_code, 201)
+
+		publish_response = self.client.post(reverse("docgen:template-publish", kwargs={"template_id": template_id}))
+		self.assertEqual(publish_response.status_code, 200)
+
+		retire_response = self.client.post(reverse("docgen:template-retire", kwargs={"template_id": template_id}))
+		self.assertEqual(retire_response.status_code, 200)
+
+		event_types = [event_type for event_type, _payload in CapturingNotificationAdapter.events]
+		self.assertIn("docgen.template.create", event_types)
+		self.assertIn("docgen.template.clone_revision", event_types)
+		self.assertIn("docgen.template.publish", event_types)
+		self.assertIn("docgen.template.retire", event_types)
+
 
 class DocumentApiTests(TestCase):
 	def setUp(self):
@@ -267,6 +371,43 @@ class DocumentApiTests(TestCase):
 		)
 		self.assertEqual(response.status_code, 201)
 		self.assertEqual(Document.objects.count(), 1)
+
+	@override_settings(DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.CapturingNotificationAdapter")
+	def test_document_create_and_set_fields_emit_notifications(self):
+		CapturingNotificationAdapter.events = []
+		payload = {
+			"template_revision_id": self.revision.id,
+			"document_type": "MEMORANDUM",
+			"title": "Notified API Document",
+			"subject": "Subject",
+		}
+		create_response = self.client.post(
+			reverse("docgen:document-collection"),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(create_response.status_code, 201)
+		document_id = create_response.json()["id"]
+
+		fields_payload = {
+			"fields": [
+				{
+					"placeholder_name": "recipient",
+					"value_text": "Director",
+					"value_json": {},
+				}
+			]
+		}
+		fields_response = self.client.post(
+			reverse("docgen:document-set-fields", kwargs={"document_id": document_id}),
+			data=json.dumps(fields_payload),
+			content_type="application/json",
+		)
+		self.assertEqual(fields_response.status_code, 200)
+
+		event_types = [event_type for event_type, _payload in CapturingNotificationAdapter.events]
+		self.assertIn("docgen.document.create", event_types)
+		self.assertIn("docgen.document.set_fields", event_types)
 
 	def test_set_document_fields_via_api(self):
 		document = Document.objects.create(
@@ -764,6 +905,22 @@ class DocumentApiTests(TestCase):
 			)
 		self.assertEqual(resolved, "manager_user")
 
+	@override_settings(DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.CapturingNotificationAdapter")
+	def test_submit_and_review_emit_document_notification_events(self):
+		CapturingNotificationAdapter.events = []
+		document = self._create_submitted_document()
+
+		review_response = self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"comment": "Reviewed"}),
+			content_type="application/json",
+		)
+		self.assertEqual(review_response.status_code, 200)
+
+		event_types = [event_type for event_type, _payload in CapturingNotificationAdapter.events]
+		self.assertIn("docgen.document.submit", event_types)
+		self.assertIn("docgen.document.review", event_types)
+
 
 class DocGenRbacTests(TestCase):
 	@override_settings(DOCGEN_ENFORCE_RBAC=True)
@@ -933,3 +1090,216 @@ class TemplateStructureApiTests(TestCase):
 		)
 		self.assertEqual(delete_response.status_code, 204)
 		self.assertEqual(self.draft_revision.workflow_stages.count(), 0)
+
+
+class DocGenSlaProcessingTests(TestCase):
+	def setUp(self):
+		CapturingNotificationAdapter.events = []
+		category = TemplateCategory.objects.create(name="SLA", slug="sla")
+		template = Template.objects.create(
+			category=category,
+			title="SLA Template",
+			code="SLA_TEMPLATE",
+		)
+		revision = TemplateRevision.objects.create(template=template, version=1, is_published=True)
+		self.document = Document.objects.create(
+			template_revision=revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="SLA Document",
+			status=DocumentStatus.UNDER_REVIEW,
+		)
+
+	@override_settings(
+		DOCGEN_SLA_REMINDER_MINUTES_BEFORE_DUE=60,
+		DOCGEN_SLA_ESCALATION_MINUTES_AFTER_DUE=120,
+		DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.CapturingNotificationAdapter",
+	)
+	def test_sla_reminder_sent_once_before_due(self):
+		now = timezone.now()
+		stage = DocumentWorkflowStage.objects.create(
+			document=self.document,
+			stage_order=1,
+			title="Review Stage",
+			execution_mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+			status=DocumentStatus.UNDER_REVIEW,
+			due_at=now + timedelta(minutes=30),
+		)
+
+		first_result = process_sla_events(now=now)
+		second_result = process_sla_events(now=now)
+
+		stage.refresh_from_db()
+		self.document.refresh_from_db()
+		events = (self.document.metadata or {}).get("events", [])
+		self.assertEqual(first_result["reminders_sent"], 1)
+		self.assertEqual(second_result["reminders_sent"], 0)
+		self.assertEqual(first_result["notifications_sent"], 1)
+		self.assertEqual(first_result["notification_failures"], 0)
+		self.assertIsNotNone(stage.reminder_sent_at)
+		self.assertEqual(len([event for event in events if event.get("action") == "sla_reminder"]), 1)
+		self.assertEqual(len(CapturingNotificationAdapter.events), 1)
+		self.assertEqual(CapturingNotificationAdapter.events[0][0], "docgen.stage.sla_reminder")
+
+	@override_settings(
+		DOCGEN_SLA_REMINDER_MINUTES_BEFORE_DUE=60,
+		DOCGEN_SLA_ESCALATION_MINUTES_AFTER_DUE=15,
+		DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.CapturingNotificationAdapter",
+	)
+	def test_sla_escalation_sent_once_after_due_threshold(self):
+		now = timezone.now()
+		stage = DocumentWorkflowStage.objects.create(
+			document=self.document,
+			stage_order=1,
+			title="Approval Stage",
+			execution_mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="approver",
+			required_action="APPROVE",
+			status=DocumentStatus.UNDER_APPROVAL,
+			due_at=now - timedelta(minutes=20),
+		)
+
+		first_result = process_sla_events(now=now)
+		second_result = process_sla_events(now=now)
+
+		stage.refresh_from_db()
+		self.document.refresh_from_db()
+		events = (self.document.metadata or {}).get("events", [])
+		self.assertEqual(first_result["escalations_sent"], 1)
+		self.assertEqual(second_result["escalations_sent"], 0)
+		self.assertEqual(first_result["notifications_sent"], 1)
+		self.assertEqual(first_result["notification_failures"], 0)
+		self.assertIsNotNone(stage.escalated_at)
+		self.assertEqual(stage.escalation_level, 1)
+		self.assertEqual(len([event for event in events if event.get("action") == "sla_escalation"]), 1)
+		self.assertEqual(len(CapturingNotificationAdapter.events), 1)
+		self.assertEqual(CapturingNotificationAdapter.events[0][0], "docgen.stage.sla_escalation")
+
+	@override_settings(
+		DOCGEN_SLA_REMINDER_MINUTES_BEFORE_DUE=60,
+		DOCGEN_SLA_ESCALATION_MINUTES_AFTER_DUE=120,
+		DOCGEN_NOTIFICATION_ADAPTER="DocGen.tests.FailingNotificationAdapter",
+	)
+	def test_sla_notification_failure_does_not_block_processing(self):
+		now = timezone.now()
+		stage = DocumentWorkflowStage.objects.create(
+			document=self.document,
+			stage_order=1,
+			title="Review Stage",
+			execution_mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+			status=DocumentStatus.UNDER_REVIEW,
+			due_at=now + timedelta(minutes=30),
+		)
+
+		result = process_sla_events(now=now)
+		stage.refresh_from_db()
+		self.assertEqual(result["reminders_sent"], 1)
+		self.assertEqual(result["notifications_sent"], 0)
+		self.assertEqual(result["notification_failures"], 1)
+		self.assertIsNotNone(stage.reminder_sent_at)
+
+
+class MockHttpResponse:
+	def __init__(self, body: bytes, status: int = 200):
+		self._body = body
+		self.status = status
+
+	def read(self):
+		return self._body
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc, tb):
+		_ = (exc_type, exc, tb)
+		return False
+
+
+class DocGenExternalAdapterIntegrationTests(TestCase):
+	def setUp(self):
+		category = TemplateCategory.objects.create(name="Adapters", slug="adapters")
+		template = Template.objects.create(
+			category=category,
+			title="Adapters Template",
+			code="ADAPTERS_TEMPLATE",
+		)
+		revision = TemplateRevision.objects.create(template=template, version=1, is_published=True)
+		originator = get_user_model().objects.create_user(username="adapter_originator", password="testpass123")
+		self.document = Document.objects.create(
+			template_revision=revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Adapter Doc",
+			originator=originator,
+		)
+
+	@override_settings(
+		DOCGEN_COMPASS_ORGCHART_ROLE_URL="https://compass.local/org/role",
+		DOCGEN_COMPASS_API_TIMEOUT_SECONDS=4,
+		DOCGEN_COMPASS_API_TOKEN="token-123",
+	)
+	@patch("DocGen.adapters.urlopen")
+	def test_compass_adapter_role_lookup_calls_external_api(self, mocked_urlopen):
+		mocked_urlopen.return_value = MockHttpResponse(body=b'{"data": {"username": "resolved_reviewer"}}')
+		adapter = CompassActorResolutionAdapter()
+
+		resolved = adapter.resolve(actor_type="ROLE", actor_value="reviewer", document=self.document)
+
+		self.assertEqual(resolved, "resolved_reviewer")
+		self.assertTrue(mocked_urlopen.called)
+		request = mocked_urlopen.call_args[0][0]
+		self.assertIn("role=reviewer", request.full_url)
+		self.assertIn(f"originator_id={self.document.originator_id}", request.full_url)
+		self.assertEqual(request.headers.get("Authorization"), "Bearer token-123")
+
+	@override_settings(
+		DOCGEN_COMPASS_ORGCHART_MANAGER_URL="https://compass.local/org/manager",
+	)
+	@patch("DocGen.adapters.urlopen")
+	def test_compass_adapter_falls_back_when_external_fails(self, mocked_urlopen):
+		mocked_urlopen.side_effect = RuntimeError("service unavailable")
+		adapter = CompassActorResolutionAdapter()
+
+		resolved = adapter.resolve(
+			actor_type="DYNAMIC",
+			actor_value="N+1_OF_ORIGINATOR",
+			document=self.document,
+		)
+
+		self.assertEqual(resolved, f"dynamic:n+1:{self.document.originator_id}")
+
+	@override_settings(
+		DOCGEN_NOTIFICATION_HTTP_ENDPOINT="https://compass.local/events",
+		DOCGEN_NOTIFICATION_TIMEOUT_SECONDS=5,
+		DOCGEN_NOTIFICATION_API_TOKEN="notify-token",
+	)
+	@patch("DocGen.notifications.urlopen")
+	def test_http_notification_adapter_publishes_event_payload(self, mocked_urlopen):
+		mocked_urlopen.return_value = MockHttpResponse(body=b"{}", status=202)
+		adapter = HttpNotificationAdapter()
+		payload = {"document_id": 123, "status": "UNDER_REVIEW"}
+
+		ok = adapter.publish(event_type="docgen.document.submit", payload=payload)
+
+		self.assertTrue(ok)
+		request = mocked_urlopen.call_args[0][0]
+		self.assertEqual(request.get_method(), "POST")
+		self.assertEqual(request.headers.get("Authorization"), "Bearer notify-token")
+		body = json.loads(request.data.decode("utf-8"))
+		self.assertEqual(body["event_type"], "docgen.document.submit")
+		self.assertEqual(body["payload"], payload)
+
+	@override_settings(DOCGEN_NOTIFICATION_HTTP_ENDPOINT="https://compass.local/events")
+	@patch("DocGen.notifications.urlopen")
+	def test_http_notification_adapter_returns_false_on_error(self, mocked_urlopen):
+		mocked_urlopen.side_effect = RuntimeError("network error")
+		adapter = HttpNotificationAdapter()
+
+		ok = adapter.publish(event_type="docgen.stage.sla_escalation", payload={"stage_id": 99})
+
+		self.assertFalse(ok)
