@@ -83,7 +83,7 @@
     this.actionError = '';
     const body = { comment: this.actionComment };
     if (action === 'delegate') body.delegate_to = this.delegateTo;
-    const resp = await fetch('{% url "docgen:document-action" document.id action="__ACTION__" %}'.replace('__ACTION__', action), {
+    const resp = await fetch('{% url "docgen:document-action" document_id=document.id action="__ACTION__" %}'.replace('__ACTION__', action), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
       body: JSON.stringify(body)

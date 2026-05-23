@@ -173,7 +173,7 @@ def document_create(request):
         .prefetch_related(
             Prefetch(
                 "revisions",
-                queryset=TemplateRevision.objects.filter(status="PUBLISHED").order_by("-version"),
+                queryset=TemplateRevision.objects.filter(is_published=True).order_by("-version"),
                 to_attr="published_revisions",
             )
         )
@@ -215,7 +215,7 @@ def document_detail_ui(request, document_id: int):
     # Placeholders from the template revision
     placeholders = list(
         TemplatePlaceholder.objects
-        .filter(template_revision=document.template_revision)
+        .filter(revision=document.template_revision)
         .order_by("display_order")
     )
 
@@ -273,10 +273,12 @@ def document_detail_ui(request, document_id: int):
     # Attachments
     attachments = list(
         document.attachments.select_related("uploaded_by").values(
-            "id", "original_name", "file_size", "uploaded_by__username", "created_at",
+            "id", "filename", "file_size", "uploaded_by__username", "created_at",
         )
     )
     for a in attachments:
+        # Keep `original_name` for existing frontend bindings.
+        a["original_name"] = a.get("filename")
         a["uploaded_by"] = a.pop("uploaded_by__username")
         a["created_at"] = a["created_at"].isoformat() if a["created_at"] else None
     attachments_json = json.dumps(attachments)
@@ -387,12 +389,12 @@ def template_detail(request, template_id: int):
 
     placeholders = list(
         TemplatePlaceholder.objects
-        .filter(template_revision=current_revision)
+        .filter(revision=current_revision)
         .order_by("display_order")
     )
     stages = list(
         TemplateWorkflowStage.objects
-        .filter(template_revision=current_revision)
+        .filter(revision=current_revision)
         .order_by("stage_order")
     )
 
