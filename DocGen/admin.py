@@ -1,6 +1,8 @@
 from django.contrib import admin
 from .models import (
 	Document,
+	DocumentAttachment,
+	DocumentComment,
 	DocumentField,
 	DocumentPDF,
 	DocumentQRToken,
@@ -117,3 +119,19 @@ class RetentionPolicyAdmin(admin.ModelAdmin):
 	list_display = ("name", "archive_retention_days", "is_active", "updated_at")
 	list_filter = ("is_active",)
 	search_fields = ("name",)
+
+
+@admin.register(DocumentComment)
+class DocumentCommentAdmin(admin.ModelAdmin):
+	list_display = ("id", "document", "author", "stage", "parent", "is_internal", "created_at")
+	list_filter = ("is_internal",)
+	search_fields = ("body", "document__reference_number")
+	raw_id_fields = ("document", "stage", "author", "parent")
+
+
+@admin.register(DocumentAttachment)
+class DocumentAttachmentAdmin(admin.ModelAdmin):
+	list_display = ("id", "document", "filename", "mime_type", "file_size", "uploaded_by", "created_at")
+	list_filter = ("mime_type",)
+	search_fields = ("filename", "document__reference_number")
+	raw_id_fields = ("document", "uploaded_by")

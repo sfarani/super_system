@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en" x-data="{ sidebarOpen: true }">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}DocGen — COMPASS{% endblock %}</title>
+  {% load static %}
+
+  <!-- Tailwind CSS (CDN — swap for local build in production) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            compass: {
+              50:  '#f0f4ff',
+              100: '#dce7ff',
+              200: '#b9cfff',
+              500: '#3b68e8',
+              600: '#2855d4',
+              700: '#1e44bb',
+              800: '#183599',
+              900: '#112370',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Alpine.js -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <!-- HTMX (optional progressive enhancement) -->
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+
+  <style>
+    [x-cloak] { display: none !important; }
+    /* Slim scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 3px; }
+  </style>
+
+  {% block extra_head %}{% endblock %}
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen flex">
+
+  <!-- Sidebar -->
+  <aside
+    :class="sidebarOpen ? 'w-64' : 'w-16'"
+    class="bg-compass-800 text-white flex flex-col transition-all duration-200 shrink-0 min-h-screen"
+  >
+    <!-- Logo / toggle -->
+    <div class="flex items-center justify-between px-4 h-16 border-b border-compass-700">
+      <span x-show="sidebarOpen" class="font-bold text-lg tracking-tight" x-cloak>DocGen</span>
+      <span x-show="!sidebarOpen" class="font-bold text-lg" x-cloak>D</span>
+      <button @click="sidebarOpen = !sidebarOpen" class="text-compass-200 hover:text-white focus:outline-none ml-auto">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+        </svg>
+      </button>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="flex-1 py-4 overflow-y-auto">
+      {% with request.resolver_match.url_name as url_name %}
+
+      <a href="{% url 'docgen:ui-dashboard' %}"
+         class="flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-md mx-2 mb-1
+                {% if url_name == 'ui-dashboard' %}bg-compass-600 text-white{% else %}text-compass-200 hover:bg-compass-700 hover:text-white{% endif %}">
+        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+        </svg>
+        <span x-show="sidebarOpen" x-cloak>Dashboard</span>
+      </a>
+
+      <a href="{% url 'docgen:ui-document-list' %}"
+         class="flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-md mx-2 mb-1
+                {% if url_name == 'ui-document-list' or url_name == 'ui-document-detail' or url_name == 'ui-document-create' %}bg-compass-600 text-white{% else %}text-compass-200 hover:bg-compass-700 hover:text-white{% endif %}">
+        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+        </svg>
+        <span x-show="sidebarOpen" x-cloak>Documents</span>
+      </a>
+
+      <a href="{% url 'docgen:ui-template-list' %}"
+         class="flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-md mx-2 mb-1
+                {% if url_name == 'ui-template-list' or url_name == 'ui-template-detail' %}bg-compass-600 text-white{% else %}text-compass-200 hover:bg-compass-700 hover:text-white{% endif %}">
+        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+        </svg>
+        <span x-show="sidebarOpen" x-cloak>Templates</span>
+      </a>
+
+      {% endwith %}
+    </nav>
+
+    <!-- User info footer -->
+    <div class="px-4 py-3 border-t border-compass-700 text-xs text-compass-300">
+      {% if user.is_authenticated %}
+        <div class="flex items-center gap-2">
+          <div class="w-7 h-7 bg-compass-500 rounded-full flex items-center justify-center text-white font-bold text-sm shrink-0">
+            {{ user.username|slice:":1"|upper }}
+          </div>
+          <div x-show="sidebarOpen" x-cloak class="truncate">
+            <p class="font-medium text-white truncate">{{ user.username }}</p>
+            <a href="{% url 'admin:logout' %}" class="hover:text-compass-100">Sign out</a>
+          </div>
+        </div>
+      {% else %}
+        <a href="{% url 'admin:login' %}" class="text-compass-200 hover:text-white">Sign in</a>
+      {% endif %}
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <div class="flex-1 flex flex-col min-h-screen overflow-hidden">
+
+    <!-- Top bar -->
+    <header class="bg-white border-b border-slate-200 h-16 flex items-center px-6 gap-4 shrink-0">
+      <h1 class="text-lg font-semibold text-slate-700">{% block page_title %}DocGen{% endblock %}</h1>
+      <div class="ml-auto flex items-center gap-3">
+        {% block header_actions %}{% endblock %}
+      </div>
+    </header>
+
+    <!-- Flash messages -->
+    {% if messages %}
+    <div class="px-6 pt-4 space-y-2">
+      {% for msg in messages %}
+        <div x-data="{ show: true }" x-show="show" x-cloak
+             class="flex items-start gap-3 p-3 rounded-lg text-sm
+                    {% if msg.tags == 'error' %}bg-red-50 text-red-800 border border-red-200
+                    {% elif msg.tags == 'success' %}bg-green-50 text-green-800 border border-green-200
+                    {% else %}bg-blue-50 text-blue-800 border border-blue-200{% endif %}">
+          <span class="flex-1">{{ msg }}</span>
+          <button @click="show = false" class="text-current opacity-60 hover:opacity-100">&times;</button>
+        </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Page body -->
+    <main class="flex-1 overflow-y-auto p-6">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  {% block extra_js %}{% endblock %}
+</body>
+</html>

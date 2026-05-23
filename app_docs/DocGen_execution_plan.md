@@ -70,7 +70,7 @@ Exit Criteria:
 - Snapshots created for key lifecycle changes.
 
 Status:
-- In progress (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, request clarification action, feature-flagged RBAC scaffolding, document finalization endpoint with QR issuance, real HTML-to-PDF artifact persistence, parallel all/any execution policies, conditional next-stage hook, actor-resolution adapter hook, archive transition with retention guard, notification adapter hooks, and tests implemented).
+- Completed (document create API, field capture API, submit API, stage-aware routing for UNDER_REVIEW/UNDER_APPROVAL, delegated action handling, transition APIs, timeline API, request clarification action, feature-flagged RBAC scaffolding, document finalization endpoint with QR issuance, real HTML-to-PDF artifact persistence, parallel all/any execution policies, conditional next-stage hook, actor-resolution adapter hook, archive transition with retention guard, notification adapter hooks, withdraw endpoint, document detail/update endpoints, and tests implemented).
 
 ## Phase 3 - Review and Approval Engine
 Duration: 5-7 days
@@ -163,12 +163,31 @@ Exit Criteria:
 - Operators can create, submit, review, approve, and verify documents from UI/API.
 - Reporting endpoints provide actionable metrics.
 
+Status:
+- API layer completed (May 2026). Implemented:
+  - GET /documents/ with full search/filter (q, status, document_type, originator, submitted_after/before, limit)
+  - GET /documents/{id}/ — document detail with fields and workflow stages inline
+  - PATCH /documents/{id}/ — update DRAFT/RETURNED document title/subject/classification
+  - POST /documents/{id}/withdraw/ — withdraw before finalization
+  - GET /documents/{id}/workflow/ — full workflow stages list with SLA/escalation fields
+  - GET /documents/{id}/pdf/ — list PDF artifact versions
+  - GET /documents/{id}/qr/ — QR token info
+  - POST /documents/{id}/qr/revoke/ — admin QR revocation
+  - POST /documents/{id}/supersede/ — link superseding finalized document
+  - GET /reports/summary/ — volume by status and document type
+  - GET /reports/sla/ — SLA breach rate and overdue count
+  - GET /reports/pending/ — pending approvals grouped by actor (dashboard widget)
+- 22 new tests added; total suite: 80/80 passing.
+- Frontend/UI remains deferred to a future sprint.
+
 ## Immediate Next Sprint Tasks
 1. Strengthen permission mapping from groups to formal Django permissions for production rollout. (Completed)
 2. Replace PDF stub generation with real HTML-to-PDF rendering pipeline and storage adapters. (Completed)
 3. Implement actor-resolution adapters against COMPASS directory/org-chart services. (Completed)
 4. Add archive listing/query APIs and retention-policy admin controls. (Completed)
 5. Defer SLA reminder/escalation Celery tasks to COMPASS integration stage (as agreed). (Implemented early with adapter-ready notification hooks)
+6. Document detail/update/withdraw/workflow/PDF/QR/supersession endpoints. (Completed)
+7. Document list search/filter and reporting APIs. (Completed)
 
 ## Definition of Done per Phase
 - Code implemented with tests.

@@ -1,0 +1,144 @@
+{% extends "docgen/base.html" %}
+
+{% block title %}Dashboard — DocGen{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+
+{% block header_actions %}
+  <a href="{% url 'docgen:ui-document-create' %}"
+     class="inline-flex items-center gap-2 bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors">
+    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+    </svg>
+    New Document
+  </a>
+{% endblock %}
+
+{% block content %}
+
+<!-- Stat cards -->
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+
+  <!-- Total documents -->
+  <div class="bg-white rounded-xl shadow-sm p-5 border border-slate-100">
+    <p class="text-xs font-medium text-slate-500 uppercase tracking-wide">Total Documents</p>
+    <p class="mt-1 text-3xl font-bold text-slate-800">{{ stats.total }}</p>
+    <p class="mt-1 text-xs text-slate-400">All statuses</p>
+  </div>
+
+  <!-- Pending actions -->
+  <div class="bg-white rounded-xl shadow-sm p-5 border border-slate-100">
+    <p class="text-xs font-medium text-slate-500 uppercase tracking-wide">Pending Actions</p>
+    <p class="mt-1 text-3xl font-bold text-amber-600">{{ stats.pending }}</p>
+    <p class="mt-1 text-xs text-slate-400">Under review / approval</p>
+  </div>
+
+  <!-- Finalized -->
+  <div class="bg-white rounded-xl shadow-sm p-5 border border-slate-100">
+    <p class="text-xs font-medium text-slate-500 uppercase tracking-wide">Finalized</p>
+    <p class="mt-1 text-3xl font-bold text-green-600">{{ stats.finalized }}</p>
+    <p class="mt-1 text-xs text-slate-400">Signed & sealed</p>
+  </div>
+
+  <!-- SLA breach -->
+  <div class="bg-white rounded-xl shadow-sm p-5 border border-slate-100">
+    <p class="text-xs font-medium text-slate-500 uppercase tracking-wide">SLA Breach Rate</p>
+    <p class="mt-1 text-3xl font-bold {% if sla.breach_rate_percent > 20 %}text-red-600{% else %}text-slate-800{% endif %}">
+      {{ sla.breach_rate_percent }}%
+    </p>
+    <p class="mt-1 text-xs text-slate-400">{{ sla.overdue }} overdue / {{ sla.total_stages_with_sla }} total</p>
+  </div>
+
+</div>
+
+<!-- Two-column lower section -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+  <!-- Pending actions inbox -->
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+      <h2 class="font-semibold text-slate-700">Pending Approvals</h2>
+      <a href="{% url 'docgen:ui-document-list' %}?status=UNDER_REVIEW"
+         class="text-xs text-compass-600 hover:underline">View all</a>
+    </div>
+    {% if pending_stages %}
+      <ul class="divide-y divide-slate-100">
+        {% for stage in pending_stages %}
+        <li class="px-5 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
+          <div class="min-w-0">
+            <a href="{% url 'docgen:ui-document-detail' stage.document_id %}"
+               class="text-sm font-medium text-compass-700 hover:underline truncate block">
+              {{ stage.document_ref|default:stage.document_id }}
+            </a>
+            <p class="text-xs text-slate-500 mt-0.5">
+              {{ stage.title }} &bull; {{ stage.actor_value }}
+            </p>
+          </div>
+          <span class="ml-3 shrink-0 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                       {% if stage.status == 'UNDER_APPROVAL' %}bg-purple-100 text-purple-700{% else %}bg-amber-100 text-amber-700{% endif %}">
+            {{ stage.status }}
+          </span>
+        </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="px-5 py-8 text-sm text-slate-400 text-center">No pending approvals.</p>
+    {% endif %}
+  </div>
+
+  <!-- Recent documents -->
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+      <h2 class="font-semibold text-slate-700">Recent Documents</h2>
+      <a href="{% url 'docgen:ui-document-list' %}" class="text-xs text-compass-600 hover:underline">View all</a>
+    </div>
+    {% if recent_docs %}
+      <ul class="divide-y divide-slate-100">
+        {% for doc in recent_docs %}
+        <li class="px-5 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
+          <div class="min-w-0">
+            <a href="{% url 'docgen:ui-document-detail' doc.id %}"
+               class="text-sm font-medium text-compass-700 hover:underline truncate block">
+              {{ doc.title|truncatechars:50 }}
+            </a>
+            <p class="text-xs text-slate-500 mt-0.5">
+              {{ doc.reference_number|default:"—" }} &bull; {{ doc.originator__username|default:"—" }}
+            </p>
+          </div>
+          <span class="ml-3 shrink-0 text-xs px-2 py-0.5 rounded font-medium
+                       {% if doc.status == 'FINALIZED' %}bg-green-100 text-green-700
+                       {% elif doc.status == 'DRAFT' %}bg-slate-100 text-slate-600
+                       {% elif doc.status == 'APPROVED' %}bg-blue-100 text-blue-700
+                       {% elif doc.status == 'ARCHIVED' %}bg-gray-100 text-gray-500
+                       {% elif doc.status == 'REJECTED' %}bg-red-100 text-red-700
+                       {% else %}bg-amber-100 text-amber-700{% endif %}">
+            {{ doc.status }}
+          </span>
+        </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="px-5 py-8 text-sm text-slate-400 text-center">No documents yet.</p>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- Status breakdown bar -->
+{% if status_breakdown %}
+<div class="mt-6 bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+  <h2 class="font-semibold text-slate-700 mb-4">Documents by Status</h2>
+  <div class="space-y-3">
+    {% for item in status_breakdown %}
+    <div class="flex items-center gap-3">
+      <span class="w-32 text-xs font-medium text-slate-600 shrink-0">{{ item.status }}</span>
+      <div class="flex-1 bg-slate-100 rounded-full h-2">
+        <div class="bg-compass-500 h-2 rounded-full" style="width: {{ item.pct }}%"></div>
+      </div>
+      <span class="text-xs text-slate-500 w-8 text-right shrink-0">{{ item.count }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

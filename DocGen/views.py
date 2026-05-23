@@ -10,7 +10,7 @@ from django.core.signing import BadSignature
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from django.db.models import Q
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils.dateparse import parse_datetime
@@ -19,7 +19,10 @@ from django.views.decorators.http import require_GET, require_http_methods
 
 from .models import (
 	Document,
+	DocumentAttachment,
+	DocumentComment,
 	DocumentField,
+	DocumentPDF,
 	DocumentQRToken,
 	DocumentRevision,
 	DocumentStatus,
@@ -32,7 +35,7 @@ from .models import (
 	TemplateStatus,
 	TemplateWorkflowStage,
 )
-from .services import emit_notification_event, generate_pdf_artifact, resolve_workflow_actor
+from .services import emit_notification_event, generate_pdf_artifact, generate_pdf_preview, resolve_workflow_actor
 
 
 _DOCGEN_PERMISSION_PREFIX = f"{Template._meta.app_label}."
@@ -522,78 +525,6 @@ def template_retire(request, template_id: int):
 			"template_id": template.id,
 			"status": template.status,
 		},
-	)
-
-
-@require_http_methods(["GET", "POST"])
-def document_collection(request):
-	if request.method == "GET":
-		documents = Document.objects.select_related("template_revision", "originator").all()[:100]
-		results = [
-			{
-				"id": document.id,
-				"title": document.title,
-				"document_type": document.document_type,
-				"status": document.status,
-				"reference_number": document.reference_number,
-				"template_revision": document.template_revision.version,
-			}
-			for document in documents
-		]
-		return JsonResponse({"count": len(results), "results": results})
-
-	try:
-		auth_error = _authorize_docgen_action(
-			request,
-			{"docgen.originator", "docgen.admin"},
-		)
-		if auth_error is not None:
-			return auth_error
-
-		payload = _parse_json_request(request)
-	except ValidationError as error:
-		return JsonResponse({"error": str(error)}, status=400)
-
-	template_revision_id = payload.get("template_revision_id")
-	document_type = payload.get("document_type")
-	title = payload.get("title")
-	subject = payload.get("subject", "")
-
-	if not template_revision_id or not document_type or not title:
-		return JsonResponse(
-			{"error": "template_revision_id, document_type, and title are required."},
-			status=400,
-		)
-
-	template_revision = get_object_or_404(TemplateRevision, pk=template_revision_id)
-	document = Document.objects.create(
-		template_revision=template_revision,
-		document_type=document_type,
-		title=title,
-		subject=subject,
-		originator=request.user if request.user.is_authenticated else None,
-	)
-	emit_notification_event(
-		event_type="docgen.document.create",
-		payload={
-			"document_id": document.id,
-			"document_type": document.document_type,
-			"status": document.status,
-			"title": document.title,
-			"subject": document.subject,
-			"template_revision": document.template_revision.version,
-			"actor": request.user.username if request.user.is_authenticated else None,
-			"timestamp": timezone.now().isoformat(),
-		},
-	)
-
-	return JsonResponse(
-		{
-			"id": document.id,
-			"status": document.status,
-			"title": document.title,
-		},
-		status=201,
 	)
 
 
@@ -1308,4 +1239,796 @@ def template_workflow_stage_detail(request, stage_id: int):
 			"title": stage.title,
 			"required_action": stage.required_action,
 		}
+	)
+
+
+@require_http_methods(["GET", "PATCH"])
+def template_revision_layout(request, revision_id: int):
+	"""GET or PATCH the layout_schema of a draft template revision."""
+	revision = get_object_or_404(TemplateRevision, pk=revision_id)
+
+	if request.method == "GET":
+		return JsonResponse({"revision_id": revision.id, "layout_schema": revision.layout_schema})
+
+	# PATCH — only allowed on unpublished revisions
+	read_only_error = _ensure_revision_editable(revision)
+	if read_only_error is not None:
+		return read_only_error
+
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	layout_schema = payload.get("layout_schema")
+	if not isinstance(layout_schema, dict):
+		return JsonResponse({"error": "layout_schema must be a JSON object."}, status=400)
+
+	revision.layout_schema = layout_schema
+	# bypass full_clean immutability check — revision is not published
+	TemplateRevision.objects.filter(pk=revision.pk).update(layout_schema=layout_schema)
+	return JsonResponse({"revision_id": revision.id, "layout_schema": revision.layout_schema})
+
+
+# ---------------------------------------------------------------------------
+# Document detail / update / withdraw
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["GET", "PATCH"])
+def document_detail(request, document_id: int):
+	document = get_object_or_404(Document.objects.select_related("template_revision", "originator"), pk=document_id)
+
+	if request.method == "GET":
+		fields = [
+			{
+				"placeholder_name": f.placeholder_name,
+				"value_text": f.value_text,
+				"value_json": f.value_json,
+			}
+			for f in document.fields.order_by("placeholder_name")
+		]
+		stages = [
+			{
+				"id": s.id,
+				"stage_order": s.stage_order,
+				"title": s.title,
+				"execution_mode": s.execution_mode,
+				"actor_type": s.actor_type,
+				"actor_value": s.actor_value,
+				"required_action": s.required_action,
+				"status": s.status,
+				"acted_at": s.acted_at,
+				"due_at": s.due_at,
+				"comments": s.comments,
+			}
+			for s in document.workflow_stages.order_by("stage_order", "id")
+		]
+		qr_token = None
+		if hasattr(document, "qr_token"):
+			qr_token = document.qr_token.token
+		return JsonResponse(
+			{
+				"id": document.id,
+				"title": document.title,
+				"subject": document.subject,
+				"document_type": document.document_type,
+				"status": document.status,
+				"classification": document.classification,
+				"reference_number": document.reference_number,
+				"originator": document.originator.username if document.originator else None,
+				"template_revision": document.template_revision.version,
+				"submitted_at": document.submitted_at,
+				"approved_at": document.approved_at,
+				"finalized_at": document.finalized_at,
+				"archived_at": document.archived_at,
+				"created_at": document.created_at,
+				"updated_at": document.updated_at,
+				"fields": fields,
+				"workflow_stages": stages,
+				"qr_token": qr_token,
+			}
+		)
+
+	# PATCH — update draft fields (title / subject / classification)
+	auth_error = _authorize_docgen_action(request, {"docgen.originator", "docgen.admin"})
+	if auth_error is not None:
+		return auth_error
+
+	if document.status not in {DocumentStatus.DRAFT, DocumentStatus.RETURNED}:
+		return JsonResponse(
+			{"error": "Only DRAFT or RETURNED documents can be updated."},
+			status=400,
+		)
+
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	editable = ["title", "subject", "classification"]
+	updated = []
+	for field_name in editable:
+		if field_name in payload:
+			setattr(document, field_name, payload[field_name])
+			updated.append(field_name)
+
+	if updated:
+		document.save(update_fields=[*updated, "updated_at"])
+
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"status": document.status,
+			"updated_fields": updated,
+		}
+	)
+
+
+@require_http_methods(["POST"])
+def document_withdraw(request, document_id: int):
+	auth_error = _authorize_docgen_action(request, {"docgen.originator", "docgen.admin"})
+	if auth_error is not None:
+		return auth_error
+
+	document = get_object_or_404(Document, pk=document_id)
+
+	withdrawable = {
+		DocumentStatus.DRAFT,
+		DocumentStatus.UNDER_REVIEW,
+		DocumentStatus.UNDER_APPROVAL,
+		DocumentStatus.RETURNED,
+	}
+	if document.status not in withdrawable:
+		return JsonResponse(
+			{"error": f"Cannot withdraw a document in status {document.status}."},
+			status=400,
+		)
+
+	payload = {}
+	if "application/json" in (request.content_type or ""):
+		try:
+			payload = _parse_json_request(request)
+		except ValidationError as error:
+			return JsonResponse({"error": str(error)}, status=400)
+
+	comment = payload.get("comment", "")
+	actor = request.user if request.user.is_authenticated else None
+
+	document.workflow_stages.filter(
+		status__in=[DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL]
+	).update(status=DocumentStatus.WITHDRAWN)
+
+	document.status = DocumentStatus.WITHDRAWN
+	_append_document_event(document=document, action="withdraw", actor=actor, comment=comment)
+	document.save(update_fields=["status", "metadata", "updated_at"])
+	_snapshot_document(document, actor=actor)
+
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"status": document.status,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document workflow stages list
+# ---------------------------------------------------------------------------
+
+@require_GET
+def document_workflow(request, document_id: int):
+	document = get_object_or_404(Document, pk=document_id)
+	stages = [
+		{
+			"id": s.id,
+			"stage_order": s.stage_order,
+			"title": s.title,
+			"execution_mode": s.execution_mode,
+			"actor_type": s.actor_type,
+			"actor_value": s.actor_value,
+			"required_action": s.required_action,
+			"status": s.status,
+			"acted_by": s.acted_by.username if s.acted_by else None,
+			"acted_at": s.acted_at,
+			"due_at": s.due_at,
+			"reminder_sent_at": s.reminder_sent_at,
+			"escalated_at": s.escalated_at,
+			"escalation_level": s.escalation_level,
+			"comments": s.comments,
+		}
+		for s in document.workflow_stages.select_related("acted_by").order_by("stage_order", "id")
+	]
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"document_status": document.status,
+			"count": len(stages),
+			"stages": stages,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document PDF list + download
+# ---------------------------------------------------------------------------
+
+@require_GET
+def document_pdf_download(request, document_id: int, pdf_id: int):
+	"""Download a specific finalized PDF artifact."""
+	document = get_object_or_404(Document, pk=document_id)
+	pdf = get_object_or_404(DocumentPDF, pk=pdf_id, document=document)
+
+	if not pdf.file:
+		return JsonResponse({"error": "PDF file not stored on disk."}, status=404)
+
+	import os
+
+	try:
+		with pdf.file.open("rb") as fh:
+			data = fh.read()
+	except OSError:
+		return JsonResponse({"error": "PDF file could not be read."}, status=404)
+
+	file_name = (
+		f"{document.reference_number or document.id}_v{pdf.version}.pdf"
+		.replace("/", "-")
+		.replace(" ", "_")
+	)
+	response = HttpResponse(data, content_type="application/pdf")
+	response["Content-Disposition"] = f'attachment; filename="{file_name}"'
+	response["Content-Length"] = len(data)
+	return response
+
+
+@require_GET
+def document_pdf_list(request, document_id: int):
+	document = get_object_or_404(Document, pk=document_id)
+	pdfs = [
+		{
+			"id": p.id,
+			"version": p.version,
+			"sha256_hash": p.sha256_hash,
+			"is_active": p.is_active,
+			"generated_by": p.generated_by.username if p.generated_by else None,
+			"created_at": p.created_at,
+			"file_name": p.file.name if p.file else None,
+		}
+		for p in document.pdf_versions.select_related("generated_by").order_by("-version")
+	]
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"count": len(pdfs),
+			"pdfs": pdfs,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document QR info + revocation
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["GET"])
+def document_qr_detail(request, document_id: int):
+	document = get_object_or_404(Document, pk=document_id)
+	try:
+		qr = document.qr_token
+	except DocumentQRToken.DoesNotExist:
+		return JsonResponse({"document_id": document.id, "qr_token": None})
+
+	verify_url = reverse("docgen:verify-token", kwargs={"token": qr.token})
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"token": qr.token,
+			"is_revoked": qr.is_revoked,
+			"revoked_reason": qr.revoked_reason,
+			"revoked_at": qr.revoked_at,
+			"verify_url": verify_url,
+			"created_at": qr.created_at,
+		}
+	)
+
+
+@require_http_methods(["POST"])
+def document_qr_revoke(request, document_id: int):
+	auth_error = _authorize_docgen_action(request, {"docgen.admin"})
+	if auth_error is not None:
+		return auth_error
+
+	document = get_object_or_404(Document, pk=document_id)
+	try:
+		qr = document.qr_token
+	except DocumentQRToken.DoesNotExist:
+		return JsonResponse({"error": "No QR token found for this document."}, status=404)
+
+	if qr.is_revoked:
+		return JsonResponse(
+			{
+				"document_id": document.id,
+				"token": qr.token,
+				"is_revoked": True,
+				"revoked_reason": qr.revoked_reason,
+			}
+		)
+
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	reason = payload.get("reason", "")
+	qr.is_revoked = True
+	qr.revoked_reason = reason
+	qr.revoked_at = timezone.now()
+	qr.save(update_fields=["is_revoked", "revoked_reason", "revoked_at", "updated_at"])
+
+	_append_document_event(
+		document=document,
+		action="qr_revoke",
+		actor=request.user if request.user.is_authenticated else None,
+		comment=reason,
+	)
+	document.save(update_fields=["metadata", "updated_at"])
+
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"token": qr.token,
+			"is_revoked": True,
+			"revoked_reason": qr.revoked_reason,
+			"revoked_at": qr.revoked_at,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document supersession
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["POST"])
+def document_supersede(request, document_id: int):
+	"""Mark document_id as superseded by a newer finalized document."""
+	auth_error = _authorize_docgen_action(request, {"docgen.admin"})
+	if auth_error is not None:
+		return auth_error
+
+	document = get_object_or_404(Document, pk=document_id)
+	if document.status not in {DocumentStatus.FINALIZED, DocumentStatus.ARCHIVED}:
+		return JsonResponse(
+			{"error": "Only FINALIZED or ARCHIVED documents can be superseded."},
+			status=400,
+		)
+
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	superseding_id = payload.get("superseding_document_id")
+	if not superseding_id:
+		return JsonResponse({"error": "superseding_document_id is required."}, status=400)
+
+	superseding = get_object_or_404(Document, pk=superseding_id)
+	if superseding.status != DocumentStatus.FINALIZED:
+		return JsonResponse(
+			{"error": "Superseding document must be FINALIZED."},
+			status=400,
+		)
+	if superseding.pk == document.pk:
+		return JsonResponse({"error": "A document cannot supersede itself."}, status=400)
+
+	superseding.supersedes = document
+	superseding.save(update_fields=["supersedes", "updated_at"])
+
+	actor = request.user if request.user.is_authenticated else None
+	_append_document_event(
+		document=document,
+		action="superseded",
+		actor=actor,
+		comment=f"Superseded by {superseding.reference_number or superseding.id}",
+	)
+	document.save(update_fields=["metadata", "updated_at"])
+
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"superseded_by": superseding.reference_number,
+			"superseding_document_id": superseding.id,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Improved document list with search / filter
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["GET", "POST"])
+def document_collection(request):
+	if request.method == "GET":
+		queryset = Document.objects.select_related("template_revision", "originator").all()
+
+		search = (request.GET.get("q") or "").strip()
+		if search:
+			queryset = queryset.filter(
+				Q(reference_number__icontains=search) | Q(title__icontains=search) | Q(subject__icontains=search)
+			)
+
+		status_filter = request.GET.get("status")
+		if status_filter:
+			queryset = queryset.filter(status=status_filter)
+
+		document_type_filter = request.GET.get("document_type")
+		if document_type_filter:
+			queryset = queryset.filter(document_type=document_type_filter)
+
+		originator_filter = request.GET.get("originator")
+		if originator_filter:
+			queryset = queryset.filter(originator__username=originator_filter)
+
+		submitted_after = request.GET.get("submitted_after")
+		if submitted_after:
+			parsed = parse_datetime(submitted_after)
+			if parsed is None:
+				return JsonResponse({"error": "submitted_after must be a valid ISO datetime."}, status=400)
+			queryset = queryset.filter(submitted_at__gte=parsed)
+
+		submitted_before = request.GET.get("submitted_before")
+		if submitted_before:
+			parsed = parse_datetime(submitted_before)
+			if parsed is None:
+				return JsonResponse({"error": "submitted_before must be a valid ISO datetime."}, status=400)
+			queryset = queryset.filter(submitted_at__lte=parsed)
+
+		limit = _coerce_positive_int(request.GET.get("limit"), default=50, max_value=200)
+		documents = list(queryset.order_by("-created_at")[:limit])
+
+		results = [
+			{
+				"id": doc.id,
+				"title": doc.title,
+				"subject": doc.subject,
+				"document_type": doc.document_type,
+				"status": doc.status,
+				"reference_number": doc.reference_number,
+				"originator": doc.originator.username if doc.originator else None,
+				"template_revision": doc.template_revision.version,
+				"submitted_at": doc.submitted_at,
+				"created_at": doc.created_at,
+			}
+			for doc in documents
+		]
+		return JsonResponse({"count": len(results), "results": results})
+
+	# POST — create document
+	try:
+		auth_error = _authorize_docgen_action(
+			request,
+			{"docgen.originator", "docgen.admin"},
+		)
+		if auth_error is not None:
+			return auth_error
+
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	template_revision_id = payload.get("template_revision_id")
+	document_type = payload.get("document_type")
+	title = payload.get("title")
+	subject = payload.get("subject", "")
+
+	if not template_revision_id or not document_type or not title:
+		return JsonResponse(
+			{"error": "template_revision_id, document_type, and title are required."},
+			status=400,
+		)
+
+	template_revision = get_object_or_404(TemplateRevision, pk=template_revision_id)
+	document = Document.objects.create(
+		template_revision=template_revision,
+		document_type=document_type,
+		title=title,
+		subject=subject,
+		originator=request.user if request.user.is_authenticated else None,
+	)
+	emit_notification_event(
+		event_type="docgen.document.create",
+		payload={
+			"document_id": document.id,
+			"document_type": document.document_type,
+			"status": document.status,
+			"title": document.title,
+			"subject": document.subject,
+			"template_revision": document.template_revision.version,
+			"actor": request.user.username if request.user.is_authenticated else None,
+			"timestamp": timezone.now().isoformat(),
+		},
+	)
+
+	return JsonResponse(
+		{
+			"id": document.id,
+			"status": document.status,
+			"title": document.title,
+		},
+		status=201,
+	)
+
+
+# ---------------------------------------------------------------------------
+# Reporting / dashboard APIs
+# ---------------------------------------------------------------------------
+
+@require_GET
+def report_summary(request):
+	"""Document volume grouped by status and document type."""
+	from django.db.models import Count
+
+	by_status = {
+		row["status"]: row["count"]
+		for row in Document.objects.values("status").annotate(count=Count("id"))
+	}
+	by_type = {
+		row["document_type"]: row["count"]
+		for row in Document.objects.values("document_type").annotate(count=Count("id"))
+	}
+	total = Document.objects.count()
+	return JsonResponse(
+		{
+			"total": total,
+			"by_status": by_status,
+			"by_document_type": by_type,
+		}
+	)
+
+
+@require_GET
+def report_sla(request):
+	"""SLA compliance stats across workflow stages."""
+	qs = DocumentWorkflowStage.objects.filter(due_at__isnull=False)
+	total = qs.count()
+	now = timezone.now()
+	overdue = qs.filter(due_at__lt=now, acted_at__isnull=True).count()
+	escalated = qs.filter(escalation_level__gt=0).count()
+
+	# breach rate
+	breach_rate = round(overdue / total * 100, 1) if total else 0.0
+
+	return JsonResponse(
+		{
+			"total_stages_with_sla": total,
+			"overdue": overdue,
+			"escalated": escalated,
+			"breach_rate_percent": breach_rate,
+		}
+	)
+
+
+@require_GET
+def report_pending(request):
+	"""Pending actions grouped by actor_value — useful for a dashboard inbox widget."""
+	from django.db.models import Count
+
+	pending_statuses = [DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL]
+	rows = (
+		DocumentWorkflowStage.objects.filter(status__in=pending_statuses)
+		.values("actor_value", "actor_type")
+		.annotate(pending_count=Count("id"))
+		.order_by("-pending_count")
+	)
+	results = [
+		{
+			"actor_value": row["actor_value"],
+			"actor_type": row["actor_type"],
+			"pending_count": row["pending_count"],
+		}
+		for row in rows
+	]
+	total_pending = sum(r["pending_count"] for r in results)
+	return JsonResponse(
+		{
+			"total_pending": total_pending,
+			"by_actor": results,
+		}
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document Comments
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["GET", "POST"])
+def document_comments(request, document_id: int):
+	"""List or create comments on a document."""
+	document = get_object_or_404(Document, pk=document_id)
+
+	if request.method == "GET":
+		stage_id = request.GET.get("stage_id")
+		qs = document.comments.select_related("author", "stage", "parent").order_by("created_at")
+		if stage_id is not None:
+			qs = qs.filter(stage_id=stage_id)
+
+		def _serialize(c):
+			return {
+				"id": c.id,
+				"body": c.body,
+				"author": c.author.username if c.author else None,
+				"stage_id": c.stage_id,
+				"parent_id": c.parent_id,
+				"is_internal": c.is_internal,
+				"created_at": c.created_at,
+				"updated_at": c.updated_at,
+			}
+
+		results = [_serialize(c) for c in qs]
+		return JsonResponse({"document_id": document.id, "count": len(results), "results": results})
+
+	# POST — add a new comment
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	body = (payload.get("body") or "").strip()
+	if not body:
+		return JsonResponse({"error": "body is required."}, status=400)
+
+	stage_id = payload.get("stage_id")
+	parent_id = payload.get("parent_id")
+	is_internal = bool(payload.get("is_internal", False))
+
+	stage = None
+	if stage_id is not None:
+		stage = get_object_or_404(DocumentWorkflowStage, pk=stage_id, document=document)
+
+	parent = None
+	if parent_id is not None:
+		parent = get_object_or_404(DocumentComment, pk=parent_id, document=document)
+
+	comment = DocumentComment.objects.create(
+		document=document,
+		stage=stage,
+		author=request.user if request.user.is_authenticated else None,
+		parent=parent,
+		body=body,
+		is_internal=is_internal,
+	)
+
+	return JsonResponse(
+		{
+			"id": comment.id,
+			"document_id": document.id,
+			"body": comment.body,
+			"author": comment.author.username if comment.author else None,
+			"stage_id": comment.stage_id,
+			"parent_id": comment.parent_id,
+			"is_internal": comment.is_internal,
+			"created_at": comment.created_at,
+		},
+		status=201,
+	)
+
+
+# ---------------------------------------------------------------------------
+# Document draft PDF preview
+# ---------------------------------------------------------------------------
+
+@require_GET
+def document_preview(request, document_id: int):
+	"""Generate and stream a DRAFT-watermarked PDF for any document status."""
+	document = get_object_or_404(Document, pk=document_id)
+	try:
+		pdf_bytes = generate_pdf_preview(document)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=500)
+
+	safe_ref = (document.reference_number or str(document.pk)).replace("/", "_")
+	filename = f"DRAFT_{safe_ref}.pdf"
+	response = HttpResponse(pdf_bytes, content_type="application/pdf")
+	response["Content-Disposition"] = f'inline; filename="{filename}"'
+	return response
+
+
+# ---------------------------------------------------------------------------
+# Document Attachments
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["GET", "POST"])
+def document_attachments(request, document_id: int):
+	"""List or upload attachments for a document."""
+	document = get_object_or_404(Document, pk=document_id)
+
+	if request.method == "GET":
+		qs = document.attachments.select_related("uploaded_by").order_by("created_at")
+		results = [
+			{
+				"id": a.id,
+				"filename": a.filename,
+				"file_size": a.file_size,
+				"mime_type": a.mime_type,
+				"description": a.description,
+				"uploaded_by": a.uploaded_by.username if a.uploaded_by else None,
+				"created_at": a.created_at,
+			}
+			for a in qs
+		]
+		return JsonResponse({"document_id": document.id, "count": len(results), "results": results})
+
+	# POST — upload a file
+	uploaded_file = request.FILES.get("file")
+	if not uploaded_file:
+		return JsonResponse({"error": "file is required as a multipart upload."}, status=400)
+
+	description = request.POST.get("description", "")
+	mime_type = uploaded_file.content_type or ""
+	filename = uploaded_file.name or "attachment"
+
+	attachment = DocumentAttachment(
+		document=document,
+		uploaded_by=request.user if request.user.is_authenticated else None,
+		filename=filename,
+		file_size=uploaded_file.size,
+		mime_type=mime_type,
+		description=description,
+	)
+	attachment.file.save(filename, uploaded_file, save=False)
+	attachment.save()
+
+	return JsonResponse(
+		{
+			"id": attachment.id,
+			"document_id": document.id,
+			"filename": attachment.filename,
+			"file_size": attachment.file_size,
+			"mime_type": attachment.mime_type,
+		},
+		status=201,
+	)
+
+
+@require_http_methods(["DELETE"])
+def document_attachment_detail(request, document_id: int, attachment_id: int):
+	"""Delete a single attachment."""
+	document = get_object_or_404(Document, pk=document_id)
+	attachment = get_object_or_404(DocumentAttachment, pk=attachment_id, document=document)
+	attachment.file.delete(save=False)
+	attachment.delete()
+	return JsonResponse({}, status=204)
+
+
+# ---------------------------------------------------------------------------
+# On-demand PDF re-generation
+# ---------------------------------------------------------------------------
+
+@require_http_methods(["POST"])
+def document_pdf_generate(request, document_id: int):
+	"""Admin-only: regenerate the PDF for any finalized document."""
+	auth_error = _authorize_docgen_action(request, {"docgen.admin"})
+	if auth_error is not None:
+		return auth_error
+
+	document = get_object_or_404(Document, pk=document_id)
+	if document.status not in {DocumentStatus.FINALIZED, DocumentStatus.ARCHIVED}:
+		return JsonResponse(
+			{"error": "Only FINALIZED or ARCHIVED documents can have their PDF regenerated."},
+			status=400,
+		)
+
+	try:
+		pdf = generate_pdf_artifact(
+			document=document,
+			generated_by=request.user if request.user.is_authenticated else None,
+		)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=500)
+
+	return JsonResponse(
+		{
+			"document_id": document.id,
+			"pdf_version": pdf.version,
+			"pdf_sha256": pdf.sha256_hash,
+			"is_active": pdf.is_active,
+		},
+		status=201,
 	)

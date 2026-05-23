@@ -1,0 +1,198 @@
+{% extends "docgen/base.html" %}
+
+{% block title %}Templates — DocGen{% endblock %}
+{% block page_title %}Templates{% endblock %}
+
+{% block header_actions %}
+  <button
+    x-data
+    @click="$dispatch('open-create-template')"
+    class="inline-flex items-center gap-2 bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors">
+    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+    </svg>
+    New Template
+  </button>
+{% endblock %}
+
+{% block content %}
+
+<div x-data="{
+  createModal: false,
+  form: { title: '', code: '', description: '', category_id: '' },
+  submitting: false,
+  formError: '',
+  csrfToken() { return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || ''; },
+  async createTemplate() {
+    if (!this.form.title.trim() || !this.form.code.trim()) {
+      this.formError = 'Title and code are required.';
+      return;
+    }
+    this.submitting = true;
+    this.formError = '';
+    const body = { title: this.form.title, code: this.form.code, description: this.form.description };
+    if (this.form.category_id) body.category_id = parseInt(this.form.category_id);
+    const resp = await fetch('{% url "docgen:template-collection" %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify(body)
+    });
+    this.submitting = false;
+    if (resp.ok) {
+      window.location.reload();
+    } else {
+      const d = await resp.json();
+      this.formError = d.error || 'Failed to create template.';
+    }
+  }
+}" @open-create-template.window="createModal = true">
+
+  <!-- Template cards grid -->
+  {% if templates %}
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      {% for tpl in templates %}
+      <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 flex flex-col gap-3">
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0">
+            <h3 class="font-semibold text-slate-800 leading-snug">{{ tpl.title }}</h3>
+            <p class="text-xs font-mono text-slate-500 mt-0.5">{{ tpl.code }}</p>
+          </div>
+          <span class="shrink-0 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                       {% if tpl.status == 'PUBLISHED' %}bg-green-100 text-green-700
+                       {% elif tpl.status == 'DRAFT' %}bg-slate-100 text-slate-600
+                       {% else %}bg-gray-100 text-gray-500{% endif %}">
+            {{ tpl.status }}
+          </span>
+        </div>
+
+        {% if tpl.description %}
+          <p class="text-sm text-slate-500 leading-relaxed">{{ tpl.description|truncatechars:120 }}</p>
+        {% endif %}
+
+        <div class="text-xs text-slate-400 flex gap-4">
+          {% if tpl.category %}
+            <span>Category: <strong class="text-slate-600">{{ tpl.category }}</strong></span>
+          {% endif %}
+          <span>Revisions: <strong class="text-slate-600">{{ tpl.revision_count }}</strong></span>
+        </div>
+
+        <!-- Actions -->
+        <div class="flex items-center gap-2 mt-auto pt-2 border-t border-slate-100 flex-wrap"
+             x-data="{
+               publishing: false,
+               retiring: false,
+               csrfToken() { return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || ''; },
+               async publish() {
+                 this.publishing = true;
+                 await fetch('{% url "docgen:template-publish" tpl.id %}', { method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken()}, body: '{}' });
+                 this.publishing = false;
+                 window.location.reload();
+               },
+               async retire() {
+                 if (!confirm('Retire this template?')) return;
+                 this.retiring = true;
+                 await fetch('{% url "docgen:template-retire" tpl.id %}', { method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken()}, body: '{}' });
+                 this.retiring = false;
+                 window.location.reload();
+               },
+               async cloneRevision() {
+                 const resp = await fetch('{% url "docgen:template-clone-revision" tpl.id %}', { method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken()}, body: '{}' });
+                 if (resp.ok) { window.location.reload(); }
+                 else { const d = await resp.json(); alert(d.error || 'Clone failed.'); }
+               }
+             }">
+          <a href="{% url 'docgen:ui-template-detail' tpl.id %}"
+             class="text-xs border border-slate-300 text-slate-600 hover:bg-slate-50 px-3 py-1.5 rounded-lg transition-colors">
+            Manage
+          </a>
+          {% if tpl.status == 'DRAFT' %}
+            <button @click="publish()" :disabled="publishing"
+                    class="text-xs bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg transition-colors">
+              <span x-text="publishing ? '…' : 'Publish'"></span>
+            </button>
+          {% endif %}
+          {% if tpl.status == 'PUBLISHED' %}
+            <button @click="cloneRevision()"
+                    class="text-xs border border-compass-300 text-compass-600 hover:bg-compass-50 px-3 py-1.5 rounded-lg transition-colors">
+              New Revision
+            </button>
+            <button @click="retire()" :disabled="retiring"
+                    class="text-xs border border-red-200 text-red-500 hover:bg-red-50 px-3 py-1.5 rounded-lg transition-colors">
+              <span x-text="retiring ? '…' : 'Retire'"></span>
+            </button>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+  {% else %}
+    <div class="text-center py-16 bg-white rounded-xl shadow-sm border border-slate-100">
+      <svg class="w-12 h-12 text-slate-300 mx-auto mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+      </svg>
+      <p class="text-slate-500 font-medium">No templates yet</p>
+      <p class="text-slate-400 text-sm mt-1">Create the first template to start generating documents.</p>
+      <button @click="createModal = true"
+              class="mt-4 inline-flex items-center gap-2 bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-4 py-2 rounded-lg">
+        Create Template
+      </button>
+    </div>
+  {% endif %}
+
+  <!-- Create template modal -->
+  <div x-show="createModal" x-cloak x-transition
+       class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
+      <h3 class="font-semibold text-slate-800 mb-5">New Template</h3>
+
+      <template x-if="formError">
+        <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="formError"></div>
+      </template>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Title <span class="text-red-400">*</span></label>
+          <input type="text" x-model="form.title" placeholder="Office Memorandum"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Code <span class="text-red-400">*</span></label>
+          <input type="text" x-model="form.code" placeholder="OFFICE_MEMO"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none font-mono uppercase" />
+          <p class="text-xs text-slate-400 mt-1">Unique identifier, uppercase letters and underscores.</p>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Description</label>
+          <textarea x-model="form.description" rows="2" placeholder="What is this template for?"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-none"></textarea>
+        </div>
+        {% if categories %}
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Category</label>
+          <select x-model="form.category_id"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            <option value="">No category</option>
+            {% for cat in categories %}
+              <option value="{{ cat.id }}">{{ cat.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="flex gap-3 justify-end mt-6">
+        <button @click="createModal = false; formError = ''"
+                class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+        <button @click="createTemplate()" :disabled="submitting"
+                class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
+          <span x-text="submitting ? 'Creating…' : 'Create'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+{% endblock %}

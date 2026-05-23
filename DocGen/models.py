@@ -553,3 +553,70 @@ class RetentionPolicy(TimeStampedModel):
 		if active is None:
 			return None
 		return active.archive_retention_days
+
+
+class DocumentComment(TimeStampedModel):
+	"""Threaded, optionally stage-scoped comment on a document."""
+
+	document = models.ForeignKey(
+		Document,
+		on_delete=models.CASCADE,
+		related_name="comments",
+	)
+	stage = models.ForeignKey(
+		DocumentWorkflowStage,
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="stage_comments",
+	)
+	author = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="docgen_comments",
+	)
+	parent = models.ForeignKey(
+		"self",
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="replies",
+	)
+	body = models.TextField()
+	is_internal = models.BooleanField(default=False)
+
+	class Meta:
+		ordering = ["created_at"]
+
+	def __str__(self):
+		return f"Comment<{self.id}> on Doc {self.document_id}"
+
+
+class DocumentAttachment(TimeStampedModel):
+	"""File attachment associated with a document."""
+
+	document = models.ForeignKey(
+		Document,
+		on_delete=models.CASCADE,
+		related_name="attachments",
+	)
+	uploaded_by = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="docgen_attachments",
+	)
+	file = models.FileField(upload_to="docgen/attachments/%Y/%m/")
+	filename = models.CharField(max_length=255)
+	file_size = models.PositiveIntegerField(default=0)
+	mime_type = models.CharField(max_length=120, blank=True)
+	description = models.TextField(blank=True)
+
+	class Meta:
+		ordering = ["created_at"]
+
+	def __str__(self):
+		return f"Attachment<{self.id}> '{self.filename}' on Doc {self.document_id}"

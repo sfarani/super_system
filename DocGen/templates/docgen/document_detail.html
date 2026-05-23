@@ -1,0 +1,696 @@
+{% extends "docgen/base.html" %}
+{% load static %}
+
+{% block title %}{{ document.title|truncatechars:40 }} — DocGen{% endblock %}
+{% block page_title %}
+  <span class="font-mono text-sm text-slate-500 mr-2">{{ document.reference_number|default:"DRAFT" }}</span>
+  {{ document.title|truncatechars:60 }}
+{% endblock %}
+
+{% block header_actions %}
+  <!-- Back to list -->
+  <a href="{% url 'docgen:ui-document-list' %}"
+     class="text-sm text-slate-500 hover:text-slate-700 flex items-center gap-1">
+    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+    </svg>
+    All Documents
+  </a>
+{% endblock %}
+
+{% block content %}
+
+<div x-data="{
+  activeTab: 'details',
+  actionModal: false,
+  selectedAction: '',
+  actionComment: '',
+  delegateTo: '',
+  submitModal: false,
+  withdrawModal: false,
+  finalizeModal: false,
+  archiveModal: false,
+  editMode: false,
+  editTitle: '{{ document.title|escapejs }}',
+  editSubject: '{{ document.subject|escapejs }}',
+  editClassification: '{{ document.classification|escapejs }}',
+  fieldsData: {{ fields_json }},
+  saving: false,
+  actionSubmitting: false,
+  actionError: '',
+
+  get statusColor() {
+    const map = {
+      DRAFT: 'bg-slate-100 text-slate-600',
+      UNDER_REVIEW: 'bg-amber-100 text-amber-700',
+      UNDER_APPROVAL: 'bg-purple-100 text-purple-700',
+      APPROVED: 'bg-blue-100 text-blue-700',
+      FINALIZED: 'bg-green-100 text-green-700',
+      ARCHIVED: 'bg-gray-100 text-gray-500',
+      RETURNED: 'bg-orange-100 text-orange-700',
+      REJECTED: 'bg-red-100 text-red-700',
+      WITHDRAWN: 'bg-orange-100 text-orange-600',
+    };
+    return map['{{ document.status }}'] || 'bg-slate-100 text-slate-600';
+  },
+
+  csrfToken() {
+    return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '';
+  },
+
+  async saveEdit() {
+    this.saving = true;
+    const resp = await fetch('{% url "docgen:document-detail" document.id %}', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ title: this.editTitle, subject: this.editSubject, classification: this.editClassification })
+    });
+    this.saving = false;
+    if (resp.ok) { window.location.reload(); }
+    else { alert('Save failed. Only DRAFT or RETURNED documents can be edited.'); }
+  },
+
+  async saveField(placeholder_name, value) {
+    await fetch('{% url "docgen:document-set-fields" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ fields: [{ placeholder_name, value_text: String(value) }] })
+    });
+  },
+
+  async doAction(action) {
+    this.actionSubmitting = true;
+    this.actionError = '';
+    const body = { comment: this.actionComment };
+    if (action === 'delegate') body.delegate_to = this.delegateTo;
+    const resp = await fetch('{% url "docgen:document-action" document.id action="__ACTION__" %}'.replace('__ACTION__', action), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify(body)
+    });
+    this.actionSubmitting = false;
+    if (resp.ok) { window.location.reload(); }
+    else {
+      const d = await resp.json();
+      this.actionError = d.error || 'Action failed.';
+    }
+  },
+
+  async doSubmit() {
+    const resp = await fetch('{% url "docgen:document-submit" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: '{}'
+    });
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); alert(d.error || 'Submit failed.'); }
+  },
+
+  async doWithdraw() {
+    const resp = await fetch('{% url "docgen:document-withdraw" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ comment: this.actionComment })
+    });
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); alert(d.error || 'Withdraw failed.'); }
+  },
+
+  async doFinalize() {
+    const resp = await fetch('{% url "docgen:document-finalize" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: '{}'
+    });
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); alert(d.error || 'Finalize failed.'); }
+  },
+
+  async doArchive() {
+    const resp = await fetch('{% url "docgen:document-archive" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ force: true })
+    });
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); alert(d.error || 'Archive failed.'); }
+  }
+}">
+
+  <!-- Header strip -->
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 px-6 py-4 mb-5 flex flex-wrap items-center gap-4">
+    <!-- Status badge -->
+    <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium" :class="statusColor">
+      {{ document.status }}
+    </span>
+
+    <!-- Meta chips -->
+    <span class="text-sm text-slate-500">Type: <strong class="text-slate-700">{{ document.document_type }}</strong></span>
+    {% if document.classification %}
+      <span class="text-sm text-slate-500">Class: <strong class="text-slate-700">{{ document.classification }}</strong></span>
+    {% endif %}
+    <span class="text-sm text-slate-500">By: <strong class="text-slate-700">{{ document.originator.username|default:"—" }}</strong></span>
+    <span class="text-sm text-slate-500">Created: <strong class="text-slate-700">{{ document.created_at|date:"d M Y" }}</strong></span>
+
+    <!-- Action buttons (right side) -->
+    <div class="ml-auto flex items-center gap-2 flex-wrap">
+
+      {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
+        <!-- Edit toggle -->
+        <button @click="editMode = !editMode"
+                class="text-sm border border-slate-300 text-slate-600 hover:bg-slate-50 px-3 py-1.5 rounded-lg transition-colors">
+          <span x-text="editMode ? 'Cancel Edit' : 'Edit'"></span>
+        </button>
+      {% endif %}
+
+      {% if document.status == 'DRAFT' %}
+        <button @click="submitModal = true"
+                class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+          Submit for Review
+        </button>
+      {% endif %}
+
+      {% if document.status in 'DRAFT,UNDER_REVIEW,UNDER_APPROVAL,RETURNED' %}
+        <button @click="withdrawModal = true"
+                class="text-sm border border-orange-300 text-orange-600 hover:bg-orange-50 px-3 py-1.5 rounded-lg transition-colors">
+          Withdraw
+        </button>
+      {% endif %}
+
+      {% if document.status == 'UNDER_REVIEW' or document.status == 'UNDER_APPROVAL' %}
+        {% for action in available_actions %}
+          <button @click="selectedAction = '{{ action }}'; actionModal = true"
+                  class="text-sm bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg transition-colors capitalize">
+            {{ action|title }}
+          </button>
+        {% endfor %}
+      {% endif %}
+
+      {% if document.status == 'APPROVED' %}
+        <button @click="finalizeModal = true"
+                class="text-sm bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+          Finalize & Issue PDF
+        </button>
+      {% endif %}
+
+      {% if document.status == 'FINALIZED' %}
+        <button @click="archiveModal = true"
+                class="text-sm border border-slate-300 text-slate-600 hover:bg-slate-50 px-3 py-1.5 rounded-lg transition-colors">
+          Archive
+        </button>
+        {% if pdf_list %}
+          <a href="{% url 'docgen:document-pdf-download' document.id pdf_list.0.id %}"
+             class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+            Download PDF
+          </a>
+        {% endif %}
+      {% endif %}
+
+      <!-- Preview PDF (all statuses) -->
+      <a href="{% url 'docgen:document-preview' document.id %}" target="_blank"
+         class="text-sm border border-slate-300 text-slate-600 hover:bg-slate-50 px-3 py-1.5 rounded-lg transition-colors">
+        Preview PDF
+      </a>
+
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="flex gap-1 mb-5 border-b border-slate-200">
+    {% for tab, label in tabs %}
+      <button @click="activeTab = '{{ tab }}'"
+              :class="activeTab === '{{ tab }}' ? 'border-b-2 border-compass-600 text-compass-700 font-medium' : 'text-slate-500 hover:text-slate-700'"
+              class="px-4 py-2.5 text-sm transition-colors -mb-px">
+        {{ label }}
+      </button>
+    {% endfor %}
+  </div>
+
+  <!-- TAB: Details -->
+  <div x-show="activeTab === 'details'">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+
+      <!-- Edit card -->
+      <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-semibold text-slate-700">Document Info</h3>
+        </div>
+
+        <template x-if="!editMode">
+          <dl class="space-y-3 text-sm">
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Title</dt>
+              <dd class="text-slate-800 font-medium">{{ document.title }}</dd>
+            </div>
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Subject</dt>
+              <dd class="text-slate-800">{{ document.subject|default:"—" }}</dd>
+            </div>
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Classification</dt>
+              <dd class="text-slate-800">{{ document.classification|default:"—" }}</dd>
+            </div>
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Template</dt>
+              <dd class="text-slate-800">{{ document.template_revision.template.title }} (v{{ document.template_revision.version }})</dd>
+            </div>
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Originator</dt>
+              <dd class="text-slate-800">{{ document.originator.username|default:"—" }}</dd>
+            </div>
+            {% if document.submitted_at %}
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Submitted</dt>
+              <dd class="text-slate-800">{{ document.submitted_at|date:"d M Y H:i" }}</dd>
+            </div>
+            {% endif %}
+            {% if document.finalized_at %}
+            <div class="flex gap-3">
+              <dt class="w-32 shrink-0 text-slate-500">Finalized</dt>
+              <dd class="text-slate-800">{{ document.finalized_at|date:"d M Y H:i" }}</dd>
+            </div>
+            {% endif %}
+          </dl>
+        </template>
+
+        <!-- Edit form -->
+        <template x-if="editMode">
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1">Title</label>
+              <input type="text" x-model="editTitle"
+                     class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1">Subject</label>
+              <input type="text" x-model="editSubject"
+                     class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1">Classification</label>
+              <input type="text" x-model="editClassification" placeholder="e.g. CONFIDENTIAL"
+                     class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            </div>
+            <button @click="saveEdit()" :disabled="saving"
+                    class="w-full bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg">
+              <span x-text="saving ? 'Saving…' : 'Save Changes'"></span>
+            </button>
+          </div>
+        </template>
+      </div>
+
+      <!-- Fields card -->
+      {% if placeholders %}
+      <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+        <h3 class="font-semibold text-slate-700 mb-4">Document Fields</h3>
+        <div class="space-y-4">
+          {% for ph in placeholders %}
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">
+              {{ ph.label }}{% if ph.is_required %} <span class="text-red-400">*</span>{% endif %}
+            </label>
+            {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
+              {% if ph.field_type == 'LONG_TEXT' %}
+                <textarea
+                  x-model="fieldsData['{{ ph.name }}']"
+                  @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
+                  rows="3"
+                  placeholder="{{ ph.label }}…"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-none"></textarea>
+              {% elif ph.field_type == 'DATE' %}
+                <input type="date"
+                  x-model="fieldsData['{{ ph.name }}']"
+                  @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+              {% elif ph.field_type == 'BOOLEAN' %}
+                <select
+                  x-model="fieldsData['{{ ph.name }}']"
+                  @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+                  <option value="">Select…</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              {% else %}
+                <input type="text"
+                  x-model="fieldsData['{{ ph.name }}']"
+                  @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
+                  placeholder="{{ ph.label }}…"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+              {% endif %}
+            {% else %}
+              <!-- Read-only display -->
+              <p class="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 min-h-[38px]">
+                <span x-text="fieldsData['{{ ph.name }}'] || '—'"></span>
+              </p>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+    </div>
+  </div>
+
+  <!-- TAB: Workflow -->
+  <div x-show="activeTab === 'workflow'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      {% if workflow_stages %}
+        <div class="divide-y divide-slate-100">
+          {% for stage in workflow_stages %}
+          <div class="px-5 py-4 flex items-start gap-4">
+            <!-- Stage number bubble -->
+            <div class="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-sm font-bold mt-0.5
+                        {% if stage.status == 'COMPLETED' or stage.status == 'APPROVED' %}bg-green-100 text-green-700
+                        {% elif stage.status == 'UNDER_REVIEW' or stage.status == 'UNDER_APPROVAL' %}bg-amber-100 text-amber-700
+                        {% elif stage.status == 'REJECTED' %}bg-red-100 text-red-700
+                        {% else %}bg-slate-100 text-slate-500{% endif %}">
+              {{ stage.stage_order }}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <p class="font-medium text-slate-800">{{ stage.title }}</p>
+                <span class="text-xs px-2 py-0.5 rounded font-medium
+                             {% if stage.status == 'COMPLETED' or stage.status == 'APPROVED' %}bg-green-100 text-green-700
+                             {% elif stage.status == 'UNDER_REVIEW' or stage.status == 'UNDER_APPROVAL' %}bg-amber-100 text-amber-700
+                             {% elif stage.status == 'REJECTED' %}bg-red-100 text-red-700
+                             {% else %}bg-slate-100 text-slate-500{% endif %}">
+                  {{ stage.status }}
+                </span>
+                <span class="text-xs text-slate-400">{{ stage.execution_mode }}</span>
+              </div>
+              <p class="text-xs text-slate-500 mt-0.5">
+                Actor: <span class="font-medium text-slate-700">{{ stage.actor_value|default:"—" }}</span>
+                &bull; Action: {{ stage.required_action }}
+              </p>
+              {% if stage.acted_by %}
+                <p class="text-xs text-slate-500 mt-0.5">
+                  Actioned by <strong>{{ stage.acted_by }}</strong>
+                  {% if stage.acted_at %}on {{ stage.acted_at|date:"d M Y H:i" }}{% endif %}
+                </p>
+              {% endif %}
+              {% if stage.comments %}
+                <p class="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded px-2 py-1 mt-2 italic">{{ stage.comments }}</p>
+              {% endif %}
+              {% if stage.due_at %}
+                <p class="text-xs text-slate-400 mt-1">
+                  Due: {{ stage.due_at|date:"d M Y H:i" }}
+                  {% if stage.escalated_at %}<span class="text-red-500 font-medium ml-2">Escalated</span>{% endif %}
+                </p>
+              {% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="px-5 py-8 text-center text-slate-400 text-sm">No workflow stages yet. Submit the document to start the workflow.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- TAB: Timeline -->
+  <div x-show="activeTab === 'timeline'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+      {% if timeline_events %}
+        <ol class="relative border-l border-slate-200 ml-3 space-y-5">
+          {% for event in timeline_events %}
+          <li class="ml-5">
+            <span class="absolute -left-2.5 flex items-center justify-center w-5 h-5 rounded-full bg-compass-100 ring-4 ring-white">
+              <svg class="w-3 h-3 text-compass-600" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd" />
+              </svg>
+            </span>
+            <div class="ml-2">
+              <p class="text-sm font-medium text-slate-800">{{ event.action|title }}</p>
+              <p class="text-xs text-slate-500 mt-0.5">
+                {% if event.actor %}{{ event.actor }} &bull; {% endif %}
+                {{ event.timestamp|date:"d M Y H:i" }}
+              </p>
+              {% if event.comment %}
+                <p class="text-xs text-slate-600 italic mt-1">{{ event.comment }}</p>
+              {% endif %}
+            </div>
+          </li>
+          {% endfor %}
+        </ol>
+      {% else %}
+        <p class="text-center text-slate-400 text-sm py-8">No timeline events yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- TAB: Comments -->
+  <div x-show="activeTab === 'comments'" x-cloak
+       x-data="{
+         comments: {{ comments_json }},
+         newComment: '',
+         posting: false,
+         async postComment() {
+           if (!this.newComment.trim()) return;
+           this.posting = true;
+           const resp = await fetch('{% url "docgen:document-comments" document.id %}', {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '' },
+             body: JSON.stringify({ body: this.newComment })
+           });
+           this.posting = false;
+           if (resp.ok) {
+             const d = await resp.json();
+             this.comments.push(d);
+             this.newComment = '';
+           }
+         }
+       }">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+      <h3 class="font-semibold text-slate-700 mb-4">Comments</h3>
+
+      <div class="space-y-4 mb-6">
+        <template x-for="c in comments" :key="c.id">
+          <div class="flex gap-3">
+            <div class="w-8 h-8 bg-slate-200 rounded-full flex items-center justify-center text-sm font-bold text-slate-600 shrink-0 mt-0.5">
+              <span x-text="(c.author || '?')[0].toUpperCase()"></span>
+            </div>
+            <div class="flex-1 bg-slate-50 rounded-lg p-3">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="text-sm font-medium text-slate-700" x-text="c.author || 'Anonymous'"></span>
+                <span class="text-xs text-slate-400" x-text="new Date(c.created_at).toLocaleString()"></span>
+                <template x-if="c.is_internal">
+                  <span class="text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-medium">Internal</span>
+                </template>
+              </div>
+              <p class="text-sm text-slate-700 whitespace-pre-wrap" x-text="c.body"></p>
+            </div>
+          </div>
+        </template>
+        <template x-if="comments.length === 0">
+          <p class="text-sm text-slate-400 text-center py-4">No comments yet.</p>
+        </template>
+      </div>
+
+      <!-- New comment -->
+      <div class="border-t border-slate-100 pt-4">
+        <textarea x-model="newComment" rows="3" placeholder="Add a comment…"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-none mb-2"></textarea>
+        <button @click="postComment()" :disabled="posting || !newComment.trim()"
+                class="bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg">
+          <span x-text="posting ? 'Posting…' : 'Post Comment'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: Attachments -->
+  <div x-show="activeTab === 'attachments'" x-cloak
+       x-data="{
+         attachments: {{ attachments_json }},
+         uploading: false,
+         async upload(event) {
+           const file = event.target.files[0];
+           if (!file) return;
+           this.uploading = true;
+           const fd = new FormData();
+           fd.append('file', file);
+           fd.append('description', '');
+           const resp = await fetch('{% url "docgen:document-attachments" document.id %}', {
+             method: 'POST',
+             headers: { 'X-CSRFToken': document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '' },
+             body: fd
+           });
+           this.uploading = false;
+           if (resp.ok) {
+             const d = await resp.json();
+             this.attachments.push(d);
+             event.target.value = '';
+           } else { alert('Upload failed.'); }
+         },
+         async deleteAttachment(id) {
+           if (!confirm('Delete this attachment?')) return;
+           const resp = await fetch('/compass/docgen/documents/{{ document.id }}/attachments/' + id + '/', {
+             method: 'DELETE',
+             headers: { 'X-CSRFToken': document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '' }
+           });
+           if (resp.ok) { this.attachments = this.attachments.filter(a => a.id !== id); }
+         }
+       }">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-semibold text-slate-700">Attachments</h3>
+        <label class="cursor-pointer inline-flex items-center gap-2 bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-3 py-1.5 rounded-lg">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+          </svg>
+          <span x-text="uploading ? 'Uploading…' : 'Upload File'"></span>
+          <input type="file" class="hidden" @change="upload($event)" :disabled="uploading" />
+        </label>
+      </div>
+
+      <template x-if="attachments.length === 0">
+        <p class="text-sm text-slate-400 text-center py-8">No attachments.</p>
+      </template>
+
+      <ul class="divide-y divide-slate-100">
+        <template x-for="att in attachments" :key="att.id">
+          <li class="py-3 flex items-center gap-3">
+            <svg class="w-5 h-5 text-slate-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+            </svg>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium text-slate-700 truncate" x-text="att.original_name || att.file_name || att.id"></p>
+              <p class="text-xs text-slate-400">
+                <span x-text="att.uploaded_by || ''"></span>
+                <span x-text="att.file_size ? ' · ' + Math.round(att.file_size / 1024) + ' KB' : ''"></span>
+              </p>
+            </div>
+            <button @click="deleteAttachment(att.id)"
+                    class="text-red-400 hover:text-red-600 transition-colors p-1" title="Delete">
+              <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </button>
+          </li>
+        </template>
+      </ul>
+    </div>
+  </div>
+
+  <!-- TAB: PDFs -->
+  <div x-show="activeTab === 'pdfs'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      {% if pdf_list %}
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-slate-200 bg-slate-50 text-left">
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Version</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">SHA-256</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Generated By</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Date</th>
+              <th class="px-4 py-3"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            {% for pdf in pdf_list %}
+            <tr class="hover:bg-slate-50">
+              <td class="px-4 py-3 font-medium">v{{ pdf.version }} {% if pdf.is_active %}<span class="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">active</span>{% endif %}</td>
+              <td class="px-4 py-3 font-mono text-xs text-slate-500">{{ pdf.sha256_hash|slice:":16" }}…</td>
+              <td class="px-4 py-3 text-slate-600">{{ pdf.generated_by__username|default:"—" }}</td>
+              <td class="px-4 py-3 text-slate-400 text-xs">{{ pdf.created_at|date:"d M Y H:i" }}</td>
+              <td class="px-4 py-3 text-right">
+                <a href="{% url 'docgen:document-pdf-download' document.id pdf.id %}"
+                   class="text-xs text-compass-600 hover:underline font-medium">Download</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="px-5 py-8 text-center text-slate-400 text-sm">No PDFs generated yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<!-- ========== MODALS ========== -->
+
+<!-- Submit confirmation -->
+<div x-show="submitModal" x-cloak x-transition
+     class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-2">Submit Document?</h3>
+    <p class="text-sm text-slate-500 mb-5">This will assign a reference number and route the document to the first workflow stage.</p>
+    <div class="flex gap-3 justify-end">
+      <button @click="submitModal = false" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="submitModal = false; doSubmit()" class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-4 py-2 rounded-lg">Submit</button>
+    </div>
+  </div>
+</div>
+
+<!-- Withdraw modal -->
+<div x-show="withdrawModal" x-cloak x-transition
+     class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-4">Withdraw Document</h3>
+    <textarea x-model="actionComment" rows="3" placeholder="Reason (optional)…"
+              class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-none mb-4"></textarea>
+    <div class="flex gap-3 justify-end">
+      <button @click="withdrawModal = false" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="withdrawModal = false; doWithdraw()" class="text-sm bg-orange-500 hover:bg-orange-600 text-white px-4 py-2 rounded-lg">Withdraw</button>
+    </div>
+  </div>
+</div>
+
+<!-- Action modal (review/approve/etc.) -->
+<div x-show="actionModal" x-cloak x-transition
+     class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-1 capitalize" x-text="selectedAction"></h3>
+    <p class="text-sm text-slate-500 mb-4">Add an optional comment before submitting this action.</p>
+    <template x-if="selectedAction === 'delegate'">
+      <div class="mb-3">
+        <input x-model="delegateTo" type="text" placeholder="Delegate to (username or role)…"
+               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none mb-2" />
+      </div>
+    </template>
+    <textarea x-model="actionComment" rows="3" placeholder="Comment (optional)…"
+              class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-none mb-2"></textarea>
+    <template x-if="actionError">
+      <p class="text-xs text-red-600 mb-3" x-text="actionError"></p>
+    </template>
+    <div class="flex gap-3 justify-end">
+      <button @click="actionModal = false; actionError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="doAction(selectedAction)" :disabled="actionSubmitting"
+              class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg capitalize"
+              x-text="actionSubmitting ? 'Submitting…' : selectedAction"></button>
+    </div>
+  </div>
+</div>
+
+<!-- Finalize modal -->
+<div x-show="finalizeModal" x-cloak x-transition
+     class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-2">Finalize Document?</h3>
+    <p class="text-sm text-slate-500 mb-5">This will generate the official PDF, issue a QR verification token, and lock the document.</p>
+    <div class="flex gap-3 justify-end">
+      <button @click="finalizeModal = false" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="finalizeModal = false; doFinalize()" class="text-sm bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg">Finalize</button>
+    </div>
+  </div>
+</div>
+
+<!-- Archive modal -->
+<div x-show="archiveModal" x-cloak x-transition
+     class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-2">Archive Document?</h3>
+    <p class="text-sm text-slate-500 mb-5">The document will be moved to the archive. This uses force=true to skip the retention window check.</p>
+    <div class="flex gap-3 justify-end">
+      <button @click="archiveModal = false" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="archiveModal = false; doArchive()" class="text-sm bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-lg">Archive</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

@@ -15,6 +15,8 @@ from .notifications import HttpNotificationAdapter
 from .services import process_sla_events
 from .models import (
 	Document,
+	DocumentAttachment,
+	DocumentComment,
 	DocumentQRToken,
 	DocumentType,
 	DocumentStatus,
@@ -1303,3 +1305,683 @@ class DocGenExternalAdapterIntegrationTests(TestCase):
 		ok = adapter.publish(event_type="docgen.stage.sla_escalation", payload={"stage_id": 99})
 
 		self.assertFalse(ok)
+
+
+class DocumentDetailApiTests(TestCase):
+	"""Tests for Phase 7 endpoints: detail, update, withdraw, workflow, PDF, QR, reports."""
+
+	def setUp(self):
+		self.category = TemplateCategory.objects.create(name="Detail", slug="detail")
+		template = Template.objects.create(
+			category=self.category,
+			title="Detail Template",
+			code="DETAIL_TEMPLATE",
+		)
+		self.revision = TemplateRevision.objects.create(
+			template=template,
+			version=1,
+			is_published=True,
+		)
+		TemplateWorkflowStage.objects.create(
+			revision=self.revision,
+			stage_order=1,
+			title="Review",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+			sla_hours=24,
+		)
+		TemplateWorkflowStage.objects.create(
+			revision=self.revision,
+			stage_order=2,
+			title="Approve",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="approver",
+			required_action="APPROVE",
+			sla_hours=24,
+		)
+
+	def _create_draft(self):
+		response = self.client.post(
+			reverse("docgen:document-collection"),
+			data=json.dumps({
+				"template_revision_id": self.revision.id,
+				"document_type": "MEMORANDUM",
+				"title": "Detail Doc",
+				"subject": "Testing detail",
+			}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
+		return Document.objects.get(pk=response.json()["id"])
+
+	def _submit(self, document):
+		self.client.post(reverse("docgen:document-submit", kwargs={"document_id": document.id}))
+		document.refresh_from_db()
+		return document
+
+	def _approve_all(self, document):
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "review"}),
+			data=json.dumps({"comment": "ok"}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": document.id, "action": "approve"}),
+			data=json.dumps({"comment": "approved"}),
+			content_type="application/json",
+		)
+		document.refresh_from_db()
+		return document
+
+	# --- GET /documents/{id}/ ---
+
+	def test_document_detail_returns_full_record(self):
+		doc = self._create_draft()
+		response = self.client.get(reverse("docgen:document-detail", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["id"], doc.id)
+		self.assertEqual(data["title"], "Detail Doc")
+		self.assertIn("fields", data)
+		self.assertIn("workflow_stages", data)
+
+	def test_document_detail_returns_404_for_unknown(self):
+		response = self.client.get(reverse("docgen:document-detail", kwargs={"document_id": 99999}))
+		self.assertEqual(response.status_code, 404)
+
+	# --- PATCH /documents/{id}/ ---
+
+	def test_update_draft_document_title(self):
+		doc = self._create_draft()
+		response = self.client.patch(
+			reverse("docgen:document-detail", kwargs={"document_id": doc.id}),
+			data=json.dumps({"title": "Updated Title", "subject": "New Subject"}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		doc.refresh_from_db()
+		self.assertEqual(doc.title, "Updated Title")
+		self.assertEqual(doc.subject, "New Subject")
+
+	def test_update_approved_document_is_blocked(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		response = self.client.patch(
+			reverse("docgen:document-detail", kwargs={"document_id": doc.id}),
+			data=json.dumps({"title": "Attempt Update"}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 400)
+
+	# --- POST /documents/{id}/withdraw/ ---
+
+	def test_withdraw_draft_document(self):
+		doc = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-withdraw", kwargs={"document_id": doc.id}),
+			data=json.dumps({"comment": "No longer needed"}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		doc.refresh_from_db()
+		self.assertEqual(doc.status, "WITHDRAWN")
+
+	def test_withdraw_under_review_document(self):
+		doc = self._submit(self._create_draft())
+		self.assertEqual(doc.status, "UNDER_REVIEW")
+		response = self.client.post(
+			reverse("docgen:document-withdraw", kwargs={"document_id": doc.id}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		doc.refresh_from_db()
+		self.assertEqual(doc.status, "WITHDRAWN")
+
+	def test_withdraw_finalized_document_is_blocked(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc.id}))
+		doc.refresh_from_db()
+		self.assertEqual(doc.status, "FINALIZED")
+		response = self.client.post(reverse("docgen:document-withdraw", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 400)
+
+	# --- GET /documents/{id}/workflow/ ---
+
+	def test_document_workflow_lists_stages(self):
+		doc = self._submit(self._create_draft())
+		response = self.client.get(reverse("docgen:document-workflow", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["document_id"], doc.id)
+		self.assertGreaterEqual(data["count"], 1)
+		self.assertIn("stages", data)
+		first_stage = data["stages"][0]
+		self.assertIn("actor_value", first_stage)
+		self.assertIn("due_at", first_stage)
+
+	# --- GET /documents/{id}/pdf/ ---
+
+	def test_document_pdf_list_empty_before_finalization(self):
+		doc = self._create_draft()
+		response = self.client.get(reverse("docgen:document-pdf-list", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.json()["count"], 0)
+
+	def test_document_pdf_list_after_finalization(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc.id}))
+		doc.refresh_from_db()
+		response = self.client.get(reverse("docgen:document-pdf-list", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["pdfs"][0]["version"], 1)
+		self.assertTrue(data["pdfs"][0]["is_active"])
+
+	# --- GET /documents/{id}/qr/ ---
+
+	def test_document_qr_detail_none_before_finalization(self):
+		doc = self._create_draft()
+		response = self.client.get(reverse("docgen:document-qr-detail", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		self.assertIsNone(response.json()["qr_token"])
+
+	def test_document_qr_detail_after_finalization(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc.id}))
+		doc.refresh_from_db()
+		response = self.client.get(reverse("docgen:document-qr-detail", kwargs={"document_id": doc.id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertIsNotNone(data["token"])
+		self.assertFalse(data["is_revoked"])
+		self.assertIn("verify_url", data)
+
+	# --- POST /documents/{id}/qr/revoke/ ---
+
+	def test_qr_revoke_marks_token_revoked(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc.id}))
+		doc.refresh_from_db()
+		response = self.client.post(
+			reverse("docgen:document-qr-revoke", kwargs={"document_id": doc.id}),
+			data=json.dumps({"reason": "Document retracted"}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertTrue(data["is_revoked"])
+		self.assertEqual(data["revoked_reason"], "Document retracted")
+		doc.qr_token.refresh_from_db()
+		self.assertTrue(doc.qr_token.is_revoked)
+
+	def test_qr_revoke_no_token_returns_404(self):
+		doc = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-qr-revoke", kwargs={"document_id": doc.id}),
+		)
+		self.assertEqual(response.status_code, 404)
+
+	# --- POST /documents/{id}/supersede/ ---
+
+	def _create_finalized(self):
+		doc = self._create_draft()
+		self._submit(doc)
+		self._approve_all(doc)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc.id}))
+		doc.refresh_from_db()
+		return doc
+
+	def test_supersede_links_documents(self):
+		original = self._create_finalized()
+		newer = self._create_finalized()
+		response = self.client.post(
+			reverse("docgen:document-supersede", kwargs={"document_id": original.id}),
+			data=json.dumps({"superseding_document_id": newer.id}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["document_id"], original.id)
+		newer.refresh_from_db()
+		self.assertEqual(newer.supersedes_id, original.id)
+
+	def test_supersede_draft_is_blocked(self):
+		original = self._create_finalized()
+		draft_superseding = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-supersede", kwargs={"document_id": original.id}),
+			data=json.dumps({"superseding_document_id": draft_superseding.id}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 400)
+
+	def test_supersede_self_is_blocked(self):
+		original = self._create_finalized()
+		response = self.client.post(
+			reverse("docgen:document-supersede", kwargs={"document_id": original.id}),
+			data=json.dumps({"superseding_document_id": original.id}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 400)
+
+	# --- GET /documents/ with filters ---
+
+	def test_document_list_filter_by_status(self):
+		self._create_draft()
+		self._create_draft()
+		response = self.client.get(
+			reverse("docgen:document-collection"),
+			{"status": "DRAFT"},
+		)
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 2)
+		for result in data["results"]:
+			self.assertEqual(result["status"], "DRAFT")
+
+	def test_document_list_search_by_title(self):
+		self._create_draft()
+		other = Document.objects.create(
+			template_revision=self.revision,
+			document_type="MEMORANDUM",
+			title="Unique XYZ Document",
+		)
+		response = self.client.get(
+			reverse("docgen:document-collection"),
+			{"q": "XYZ"},
+		)
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["results"][0]["id"], other.id)
+
+	# --- Reports ---
+
+	def test_report_summary_returns_counts(self):
+		self._create_draft()
+		self._create_draft()
+		response = self.client.get(reverse("docgen:report-summary"))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertIn("total", data)
+		self.assertIn("by_status", data)
+		self.assertIn("by_document_type", data)
+		self.assertGreaterEqual(data["total"], 2)
+
+	def test_report_sla_returns_stats(self):
+		doc = self._submit(self._create_draft())
+		response = self.client.get(reverse("docgen:report-sla"))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertIn("total_stages_with_sla", data)
+		self.assertIn("overdue", data)
+		self.assertIn("breach_rate_percent", data)
+		self.assertGreaterEqual(data["total_stages_with_sla"], 1)
+
+	def test_report_pending_returns_by_actor(self):
+		doc = self._submit(self._create_draft())
+		response = self.client.get(reverse("docgen:report-pending"))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertIn("total_pending", data)
+		self.assertIn("by_actor", data)
+		self.assertGreaterEqual(data["total_pending"], 1)
+
+
+class DocumentCommentsAndPreviewTests(TestCase):
+	"""Tests for Phase 8: document comments and draft PDF preview."""
+
+	def setUp(self):
+		self.category = TemplateCategory.objects.create(name="Comments", slug="comments")
+		template = Template.objects.create(
+			category=self.category,
+			title="Comments Template",
+			code="COMMENTS_TEMPLATE",
+		)
+		self.revision = TemplateRevision.objects.create(
+			template=template,
+			version=1,
+			is_published=True,
+		)
+		TemplateWorkflowStage.objects.create(
+			revision=self.revision,
+			stage_order=1,
+			title="Review",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+			sla_hours=24,
+		)
+
+	def _create_draft(self):
+		response = self.client.post(
+			reverse("docgen:document-collection"),
+			data=json.dumps({
+				"template_revision_id": self.revision.id,
+				"document_type": "MEMORANDUM",
+				"title": "Comments Doc",
+			}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
+		return response.json()["id"]
+
+	def _submit(self, document_id):
+		response = self.client.post(reverse("docgen:document-submit", kwargs={"document_id": document_id}))
+		self.assertEqual(response.status_code, 200)
+		return document_id
+
+	# --- Comments: empty list ---
+
+	def test_comments_list_empty_on_new_document(self):
+		doc_id = self._create_draft()
+		response = self.client.get(reverse("docgen:document-comments", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 0)
+		self.assertEqual(data["results"], [])
+
+	# --- Comments: add and retrieve ---
+
+	def test_add_comment_to_document(self):
+		doc_id = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Please review section 2."}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
+		data = response.json()
+		self.assertEqual(data["body"], "Please review section 2.")
+		self.assertIsNone(data["stage_id"])
+		self.assertIsNone(data["parent_id"])
+
+	def test_comment_list_after_add(self):
+		doc_id = self._create_draft()
+		self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "First comment."}),
+			content_type="application/json",
+		)
+		response = self.client.get(reverse("docgen:document-comments", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["results"][0]["body"], "First comment.")
+
+	def test_add_comment_requires_body(self):
+		doc_id = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": ""}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 400)
+
+	# --- Comments: stage-scoped ---
+
+	def test_stage_scoped_comment(self):
+		doc_id = self._submit(self._create_draft())
+		doc = Document.objects.get(pk=doc_id)
+		stage = doc.workflow_stages.first()
+		response = self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Stage note.", "stage_id": stage.id}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
+		data = response.json()
+		self.assertEqual(data["stage_id"], stage.id)
+
+	def test_filter_comments_by_stage_id(self):
+		doc_id = self._submit(self._create_draft())
+		doc = Document.objects.get(pk=doc_id)
+		stage = doc.workflow_stages.first()
+		# Add one stage-scoped and one document-level comment
+		self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Stage comment.", "stage_id": stage.id}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Doc comment."}),
+			content_type="application/json",
+		)
+		response = self.client.get(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			{"stage_id": stage.id},
+		)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["results"][0]["body"], "Stage comment.")
+
+	# --- Comments: threaded replies ---
+
+	def test_threaded_reply(self):
+		doc_id = self._create_draft()
+		parent_resp = self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Parent comment."}),
+			content_type="application/json",
+		)
+		parent_id = parent_resp.json()["id"]
+		reply_resp = self.client.post(
+			reverse("docgen:document-comments", kwargs={"document_id": doc_id}),
+			data=json.dumps({"body": "Reply.", "parent_id": parent_id}),
+			content_type="application/json",
+		)
+		self.assertEqual(reply_resp.status_code, 201)
+		self.assertEqual(reply_resp.json()["parent_id"], parent_id)
+
+	# --- Comments: 404 for unknown document ---
+
+	def test_comments_404_for_unknown_document(self):
+		response = self.client.get(reverse("docgen:document-comments", kwargs={"document_id": 99999}))
+		self.assertEqual(response.status_code, 404)
+
+	# --- Draft PDF preview ---
+
+	def test_preview_returns_pdf_content_type(self):
+		doc_id = self._create_draft()
+		response = self.client.get(reverse("docgen:document-preview", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response["Content-Type"], "application/pdf")
+
+	def test_preview_content_disposition_contains_draft(self):
+		doc_id = self._create_draft()
+		response = self.client.get(reverse("docgen:document-preview", kwargs={"document_id": doc_id}))
+		self.assertIn("DRAFT", response["Content-Disposition"])
+
+	def test_preview_returns_non_empty_bytes(self):
+		doc_id = self._create_draft()
+		response = self.client.get(reverse("docgen:document-preview", kwargs={"document_id": doc_id}))
+		self.assertGreater(len(response.content), 100)
+
+	def test_preview_404_for_unknown_document(self):
+		response = self.client.get(reverse("docgen:document-preview", kwargs={"document_id": 99999}))
+		self.assertEqual(response.status_code, 404)
+
+	def test_preview_works_on_submitted_document(self):
+		doc_id = self._submit(self._create_draft())
+		response = self.client.get(reverse("docgen:document-preview", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response["Content-Type"], "application/pdf")
+
+
+class DocumentAttachmentsAndPdfRegenTests(TestCase):
+	"""Tests for Phase 9: document attachments and on-demand PDF regeneration."""
+
+	def setUp(self):
+		self.category = TemplateCategory.objects.create(name="Attach", slug="attach")
+		template = Template.objects.create(
+			category=self.category,
+			title="Attach Template",
+			code="ATTACH_TEMPLATE",
+		)
+		self.revision = TemplateRevision.objects.create(
+			template=template,
+			version=1,
+			is_published=True,
+		)
+		TemplateWorkflowStage.objects.create(
+			revision=self.revision,
+			stage_order=1,
+			title="Review",
+			mode="SEQUENTIAL",
+			actor_type="ROLE",
+			actor_value="reviewer",
+			required_action="REVIEW",
+			sla_hours=24,
+		)
+
+	def _create_draft(self):
+		response = self.client.post(
+			reverse("docgen:document-collection"),
+			data=json.dumps({
+				"template_revision_id": self.revision.id,
+				"document_type": "MEMORANDUM",
+				"title": "Attach Doc",
+			}),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
+		return response.json()["id"]
+
+	def _finalize(self, doc_id):
+		"""Submit → approve → finalize a document."""
+		self.client.post(reverse("docgen:document-submit", kwargs={"document_id": doc_id}))
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": doc_id, "action": "review"}),
+			data=json.dumps({}),
+			content_type="application/json",
+		)
+		self.client.post(reverse("docgen:document-finalize", kwargs={"document_id": doc_id}))
+		return doc_id
+
+	# --- Attachments: empty list ---
+
+	def test_attachment_list_empty(self):
+		doc_id = self._create_draft()
+		response = self.client.get(reverse("docgen:document-attachments", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.json()["count"], 0)
+
+	# --- Attachments: upload ---
+
+	def test_upload_attachment(self):
+		from django.core.files.uploadedfile import SimpleUploadedFile
+		doc_id = self._create_draft()
+		f = SimpleUploadedFile("report.txt", b"file content here", content_type="text/plain")
+		response = self.client.post(
+			reverse("docgen:document-attachments", kwargs={"document_id": doc_id}),
+			data={"file": f, "description": "Supporting report"},
+		)
+		self.assertEqual(response.status_code, 201)
+		data = response.json()
+		self.assertEqual(data["filename"], "report.txt")
+		self.assertEqual(data["mime_type"], "text/plain")
+
+	def test_attachment_appears_in_list(self):
+		from django.core.files.uploadedfile import SimpleUploadedFile
+		doc_id = self._create_draft()
+		f = SimpleUploadedFile("notes.txt", b"notes", content_type="text/plain")
+		self.client.post(
+			reverse("docgen:document-attachments", kwargs={"document_id": doc_id}),
+			data={"file": f},
+		)
+		response = self.client.get(reverse("docgen:document-attachments", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.json()["count"], 1)
+		self.assertEqual(response.json()["results"][0]["filename"], "notes.txt")
+
+	def test_upload_requires_file(self):
+		doc_id = self._create_draft()
+		response = self.client.post(
+			reverse("docgen:document-attachments", kwargs={"document_id": doc_id}),
+			data={},
+		)
+		self.assertEqual(response.status_code, 400)
+
+	# --- Attachments: delete ---
+
+	def test_delete_attachment(self):
+		from django.core.files.uploadedfile import SimpleUploadedFile
+		doc_id = self._create_draft()
+		f = SimpleUploadedFile("delete_me.txt", b"data", content_type="text/plain")
+		upload_resp = self.client.post(
+			reverse("docgen:document-attachments", kwargs={"document_id": doc_id}),
+			data={"file": f},
+		)
+		attachment_id = upload_resp.json()["id"]
+		del_resp = self.client.delete(
+			reverse("docgen:document-attachment-detail", kwargs={"document_id": doc_id, "attachment_id": attachment_id})
+		)
+		self.assertEqual(del_resp.status_code, 204)
+		self.assertFalse(DocumentAttachment.objects.filter(pk=attachment_id).exists())
+
+	def test_delete_attachment_404_wrong_document(self):
+		from django.core.files.uploadedfile import SimpleUploadedFile
+		doc1_id = self._create_draft()
+		doc2_id = self._create_draft()
+		f = SimpleUploadedFile("file.txt", b"x", content_type="text/plain")
+		upload_resp = self.client.post(
+			reverse("docgen:document-attachments", kwargs={"document_id": doc1_id}),
+			data={"file": f},
+		)
+		attachment_id = upload_resp.json()["id"]
+		# Try to delete attachment from wrong document
+		del_resp = self.client.delete(
+			reverse("docgen:document-attachment-detail", kwargs={"document_id": doc2_id, "attachment_id": attachment_id})
+		)
+		self.assertEqual(del_resp.status_code, 404)
+
+	# --- On-demand PDF regeneration ---
+
+	def test_pdf_regen_on_finalized_document(self):
+		doc_id = self._finalize(self._create_draft())
+		response = self.client.post(reverse("docgen:document-pdf-generate", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 201)
+		data = response.json()
+		self.assertIn("pdf_version", data)
+		self.assertGreater(data["pdf_version"], 1)  # v1 was from finalize, this is v2
+
+	def test_pdf_regen_blocked_on_draft(self):
+		doc_id = self._create_draft()
+		response = self.client.post(reverse("docgen:document-pdf-generate", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 400)
+
+	def test_pdf_regen_creates_new_version(self):
+		doc_id = self._finalize(self._create_draft())
+		# First regen
+		self.client.post(reverse("docgen:document-pdf-generate", kwargs={"document_id": doc_id}))
+		# Second regen
+		response = self.client.post(reverse("docgen:document-pdf-generate", kwargs={"document_id": doc_id}))
+		self.assertEqual(response.status_code, 201)
+		self.assertGreaterEqual(response.json()["pdf_version"], 3)
+
+	# --- QR image in finalized PDF ---
+
+	def test_finalized_pdf_contains_qr_data(self):
+		"""PDF bytes for a finalized doc should be non-empty (QR image embedded)."""
+		doc_id = self._finalize(self._create_draft())
+		doc = Document.objects.get(pk=doc_id)
+		active_pdf = doc.pdf_versions.filter(is_active=True).first()
+		self.assertIsNotNone(active_pdf)
+		active_pdf.file.open("rb")
+		content = active_pdf.file.read()
+		active_pdf.file.close()
+		self.assertGreater(len(content), 500)  # non-trivial PDF with QR

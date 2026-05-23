@@ -118,7 +118,16 @@ Base prefix: /compass/docgen/
 ## Document APIs
 
 - GET /documents/
-  - Purpose: list recent documents
+  - Purpose: list documents with optional filters
+  - Query params (optional):
+    - q: partial match on reference_number, title, or subject
+    - status: exact enum match (DRAFT, UNDER_REVIEW, etc.)
+    - document_type: exact enum match
+    - originator: username exact match
+    - submitted_after: ISO datetime
+    - submitted_before: ISO datetime
+    - limit: max rows (default 50, max 200)
+  - Response includes: id, title, subject, document_type, status, reference_number, originator, submitted_at
 
 - POST /documents/
   - Purpose: create draft document
@@ -129,6 +138,27 @@ Base prefix: /compass/docgen/
       "title": "Memo for Review",
       "subject": "Subject"
     }
+
+- GET /documents/{document_id}/
+  - Purpose: retrieve full document record
+  - Response includes: id, title, subject, document_type, status, classification,
+    reference_number, originator, template_revision, timestamps, fields[], workflow_stages[], qr_token
+
+- PATCH /documents/{document_id}/
+  - Purpose: update editable fields on DRAFT or RETURNED documents
+  - Body (all optional):
+    {
+      "title": "New Title",
+      "subject": "New Subject",
+      "classification": "FOR OFFICIAL USE ONLY"
+    }
+  - Guard: only DRAFT or RETURNED documents can be updated
+
+- POST /documents/{document_id}/withdraw/
+  - Purpose: withdraw a document before finalization
+  - Allowed from: DRAFT, UNDER_REVIEW, UNDER_APPROVAL, RETURNED
+  - Body (optional): {"comment": "reason"}
+  - Response: {"document_id": 1, "status": "WITHDRAWN"}
 
 - POST /documents/{document_id}/fields/
   - Purpose: upsert placeholder values
@@ -182,6 +212,36 @@ Base prefix: /compass/docgen/
   - PARALLEL_ALL: all active stages in the same order must complete before advancing
   - PARALLEL_ANY: first completion advances and sibling active stages auto-close
 - Actor values are resolved through an adapter hook during submit (currently stubbed for integration).
+
+## Document Workflow Stages API
+
+- GET /documents/{document_id}/workflow/
+  - Purpose: list all workflow stages for a document with full detail
+  - Response:
+    {
+      "document_id": 1,
+      "document_status": "UNDER_REVIEW",
+      "count": 2,
+      "stages": [
+        {
+          "id": 10,
+          "stage_order": 1,
+          "title": "Initial Review",
+          "execution_mode": "SEQUENTIAL",
+          "actor_type": "ROLE",
+          "actor_value": "role:reviewer",
+          "required_action": "REVIEW",
+          "status": "UNDER_REVIEW",
+          "acted_by": null,
+          "acted_at": null,
+          "due_at": "...",
+          "reminder_sent_at": null,
+          "escalated_at": null,
+          "escalation_level": 0,
+          "comments": ""
+        }
+      ]
+    }
 
 ## Timeline API
 
@@ -372,6 +432,9 @@ Base prefix: /compass/docgen/
   - docgen.document.delegate
   - docgen.document.finalize
   - docgen.document.archive
+  - docgen.document.withdraw
+  - docgen.document.qr_revoke
+  - docgen.document.superseded
 
 - Current emitted template lifecycle event types:
   - docgen.template.create
@@ -382,3 +445,102 @@ Base prefix: /compass/docgen/
 - Integration-test coverage:
   - Mocked COMPASS actor-resolution adapter HTTP calls (success + fallback)
   - Mocked notification HTTP adapter publish calls (success + failure)
+
+## Document PDF API
+
+- GET /documents/{document_id}/pdf/
+  - Purpose: list PDF artifact versions for a document
+  - Response:
+    {
+      "document_id": 1,
+      "count": 1,
+      "pdfs": [
+        {
+          "id": 3,
+          "version": 1,
+          "sha256_hash": "abc123...",
+          "is_active": true,
+          "generated_by": "admin",
+          "created_at": "...",
+          "file_name": "docgen/pdfs/2026/05/..."
+        }
+      ]
+    }
+
+## Document QR API
+
+- GET /documents/{document_id}/qr/
+  - Purpose: retrieve QR token info for a document
+  - Response when token exists:
+    {
+      "document_id": 1,
+      "token": "abc123",
+      "is_revoked": false,
+      "revoked_reason": "",
+      "revoked_at": null,
+      "verify_url": "/compass/docgen/verify/abc123/",
+      "created_at": "..."
+    }
+  - Response when no token:
+    {
+      "document_id": 1,
+      "qr_token": null
+    }
+
+- POST /documents/{document_id}/qr/revoke/
+  - Purpose: revoke a QR token (admin only)
+  - Body (optional): {"reason": "Document retracted"}
+  - Response:
+    {
+      "document_id": 1,
+      "token": "abc123",
+      "is_revoked": true,
+      "revoked_reason": "Document retracted",
+      "revoked_at": "..."
+    }
+
+## Document Supersession API
+
+- POST /documents/{document_id}/supersede/
+  - Purpose: link a newer finalized document as superseding the given document (admin only)
+  - Guard: document_id must be FINALIZED or ARCHIVED; superseding document must be FINALIZED
+  - Body: {"superseding_document_id": 42}
+  - Response:
+    {
+      "document_id": 1,
+      "superseded_by": "COMPASS/HQ/MEM/2026/00042",
+      "superseding_document_id": 42
+    }
+  - Effect: the verify endpoint for document_id will then return status "superseded"
+
+## Reporting APIs
+
+- GET /reports/summary/
+  - Purpose: document volume grouped by status and document type
+  - Response:
+    {
+      "total": 42,
+      "by_status": {"DRAFT": 5, "FINALIZED": 30, ...},
+      "by_document_type": {"MEMORANDUM": 20, "OFFICE_ORDER": 10, ...}
+    }
+
+- GET /reports/sla/
+  - Purpose: SLA compliance statistics across all workflow stages with due dates
+  - Response:
+    {
+      "total_stages_with_sla": 100,
+      "overdue": 8,
+      "escalated": 3,
+      "breach_rate_percent": 8.0
+    }
+
+- GET /reports/pending/
+  - Purpose: pending workflow actions grouped by actor (dashboard inbox widget)
+  - Response:
+    {
+      "total_pending": 15,
+      "by_actor": [
+        {"actor_value": "role:approver", "actor_type": "ROLE", "pending_count": 7},
+        ...
+      ]
+    }

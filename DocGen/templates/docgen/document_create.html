@@ -1,0 +1,199 @@
+{% extends "docgen/base.html" %}
+
+{% block title %}New Document — DocGen{% endblock %}
+{% block page_title %}New Document{% endblock %}
+
+{% block content %}
+<div x-data="{
+  step: 1,
+  selectedRevision: null,
+  selectedRevisionId: {{ selected_revision_id|default:'null' }},
+  templateId: {{ template_id|default:'null' }},
+  form: {
+    template_revision_id: {{ selected_revision_id|default:'null' }},
+    document_type: '',
+    title: '',
+    subject: '',
+    fields: {}
+  },
+  placeholders: {{ placeholders_json|default:'[]' }},
+  submitting: false,
+  errors: {},
+
+  selectRevision(revId, templateId) {
+    this.form.template_revision_id = revId;
+    this.selectedRevisionId = revId;
+    this.templateId = templateId;
+    this.step = 2;
+  },
+
+  validateStep2() {
+    this.errors = {};
+    if (!this.form.template_revision_id) this.errors.template = 'Select a template.';
+    if (!this.form.document_type) this.errors.document_type = 'Select a document type.';
+    if (!this.form.title.trim()) this.errors.title = 'Title is required.';
+    return Object.keys(this.errors).length === 0;
+  },
+
+  async createDocument() {
+    if (!this.validateStep2()) return;
+    this.submitting = true;
+    try {
+      const resp = await fetch('{% url "docgen:document-collection" %}', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': document.cookie.match(/csrftoken=([^;]+)/)?.[1] || ''
+        },
+        body: JSON.stringify({
+          template_revision_id: this.form.template_revision_id,
+          document_type: this.form.document_type,
+          title: this.form.title,
+          subject: this.form.subject
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        this.errors.server = data.error || 'Failed to create document.';
+        this.submitting = false;
+        return;
+      }
+      // Redirect to the new document's detail/edit page
+      window.location.href = '/compass/docgen/ui/documents/' + data.id + '/';
+    } catch(e) {
+      this.errors.server = 'Network error. Please try again.';
+      this.submitting = false;
+    }
+  }
+}">
+
+  <!-- Step indicator -->
+  <ol class="flex items-center gap-0 mb-8 max-w-md">
+    <li class="flex items-center gap-2">
+      <span :class="step >= 1 ? 'bg-compass-600 text-white' : 'bg-slate-200 text-slate-500'"
+            class="w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0">1</span>
+      <span :class="step >= 1 ? 'text-slate-800 font-medium' : 'text-slate-400'" class="text-sm">Choose Template</span>
+    </li>
+    <div class="flex-1 h-px bg-slate-200 mx-3 max-w-12"></div>
+    <li class="flex items-center gap-2">
+      <span :class="step >= 2 ? 'bg-compass-600 text-white' : 'bg-slate-200 text-slate-500'"
+            class="w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0">2</span>
+      <span :class="step >= 2 ? 'text-slate-800 font-medium' : 'text-slate-400'" class="text-sm">Document Details</span>
+    </li>
+  </ol>
+
+  <!-- Step 1: Choose Template -->
+  <div x-show="step === 1">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-100">
+        <h2 class="font-semibold text-slate-700">Select a Template</h2>
+        <p class="text-sm text-slate-500 mt-1">Choose a published template to base your document on.</p>
+      </div>
+
+      {% if templates %}
+        <ul class="divide-y divide-slate-100">
+          {% for tpl in templates %}
+          <li class="px-5 py-4 hover:bg-slate-50 transition-colors">
+            <div class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <p class="font-medium text-slate-800">{{ tpl.title }}</p>
+                <p class="text-xs text-slate-400 mt-0.5">
+                  Code: <span class="font-mono">{{ tpl.code }}</span>
+                  {% if tpl.category %} &bull; {{ tpl.category }}{% endif %}
+                </p>
+                {% if tpl.description %}
+                  <p class="text-sm text-slate-500 mt-1">{{ tpl.description|truncatechars:120 }}</p>
+                {% endif %}
+              </div>
+              <div class="shrink-0">
+                {% if tpl.latest_published_revision_id %}
+                  <button
+                    @click="selectRevision({{ tpl.latest_published_revision_id }}, {{ tpl.id }})"
+                    class="bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors whitespace-nowrap">
+                    Use Template
+                  </button>
+                {% else %}
+                  <span class="text-xs text-slate-400 italic">No published revision</span>
+                {% endif %}
+              </div>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="text-center py-16">
+          <p class="text-slate-500 font-medium">No published templates available.</p>
+          <p class="text-slate-400 text-sm mt-1">
+            <a href="{% url 'docgen:ui-template-list' %}" class="text-compass-600 hover:underline">Create a template first.</a>
+          </p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Step 2: Document Details -->
+  <div x-show="step === 2" x-cloak>
+    <div class="max-w-xl bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-5">
+      <div class="flex items-center gap-3 mb-2">
+        <button @click="step = 1" class="text-compass-600 hover:underline text-sm">&larr; Back</button>
+        <h2 class="font-semibold text-slate-700">Document Details</h2>
+      </div>
+
+      <!-- Error banner -->
+      <template x-if="errors.server">
+        <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3" x-text="errors.server"></div>
+      </template>
+
+      <!-- Document type -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">
+          Document Type <span class="text-red-500">*</span>
+        </label>
+        <select x-model="form.document_type"
+                class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 focus:border-compass-500 outline-none bg-white">
+          <option value="">Select type…</option>
+          {% for t in type_choices %}
+            <option value="{{ t }}">{{ t }}</option>
+          {% endfor %}
+        </select>
+        <template x-if="errors.document_type">
+          <p class="mt-1 text-xs text-red-600" x-text="errors.document_type"></p>
+        </template>
+      </div>
+
+      <!-- Title -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">
+          Title <span class="text-red-500">*</span>
+        </label>
+        <input type="text" x-model="form.title" placeholder="Document title…"
+               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 focus:border-compass-500 outline-none" />
+        <template x-if="errors.title">
+          <p class="mt-1 text-xs text-red-600" x-text="errors.title"></p>
+        </template>
+      </div>
+
+      <!-- Subject -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">Subject</label>
+        <input type="text" x-model="form.subject" placeholder="Brief subject line…"
+               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 focus:border-compass-500 outline-none" />
+      </div>
+
+      <!-- Submit -->
+      <div class="pt-2">
+        <button @click="createDocument()"
+                :disabled="submitting"
+                class="w-full bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white font-medium py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2">
+          <svg x-show="submitting" class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+          </svg>
+          <span x-text="submitting ? 'Creating…' : 'Create Document'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

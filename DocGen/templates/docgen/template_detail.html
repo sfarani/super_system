@@ -1,0 +1,401 @@
+{% extends "docgen/base.html" %}
+
+{% block title %}{{ template.title }} — Templates — DocGen{% endblock %}
+{% block page_title %}{{ template.title }}{% endblock %}
+
+{% block header_actions %}
+  <a href="{% url 'docgen:ui-template-list' %}"
+     class="text-sm text-slate-500 hover:text-slate-700 flex items-center gap-1">
+    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+    </svg>
+    Templates
+  </a>
+{% endblock %}
+
+{% block content %}
+
+<div x-data="{
+  activeTab: 'placeholders',
+  csrfToken() { return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || ''; },
+
+  /* Placeholders */
+  phModal: false,
+  phForm: { name: '', label: '', field_type: 'SHORT_TEXT', is_required: false, display_order: 1, config: '{}' },
+  phSubmitting: false,
+  phError: '',
+  async savePlaceholder() {
+    this.phSubmitting = true; this.phError = '';
+    let config = {};
+    try { config = JSON.parse(this.phForm.config || '{}'); } catch { config = {}; }
+    const resp = await fetch('{% url "docgen:template-revision-placeholders" revision_id=current_revision.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ name: this.phForm.name, label: this.phForm.label, field_type: this.phForm.field_type,
+                             is_required: this.phForm.is_required, display_order: parseInt(this.phForm.display_order)||1, config })
+    });
+    this.phSubmitting = false;
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); this.phError = d.error || 'Failed to add placeholder.'; }
+  },
+  async deletePlaceholder(id) {
+    if (!confirm('Delete this placeholder?')) return;
+    await fetch('/compass/docgen/template-placeholders/' + id + '/', { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } });
+    window.location.reload();
+  },
+
+  /* Workflow stages */
+  stageModal: false,
+  stageForm: { stage_order: 1, title: '', mode: 'SEQUENTIAL', actor_type: 'USER', actor_value: '', required_action: 'REVIEW', sla_hours: 24, is_mandatory: true },
+  stageSubmitting: false,
+  stageError: '',
+  async saveStage() {
+    this.stageSubmitting = true; this.stageError = '';
+    const resp = await fetch('{% url "docgen:template-revision-workflow-stages" revision_id=current_revision.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({
+        stage_order: parseInt(this.stageForm.stage_order)||1,
+        title: this.stageForm.title,
+        mode: this.stageForm.mode,
+        actor_type: this.stageForm.actor_type,
+        actor_value: this.stageForm.actor_value,
+        required_action: this.stageForm.required_action,
+        sla_hours: parseInt(this.stageForm.sla_hours)||24,
+        is_mandatory: this.stageForm.is_mandatory
+      })
+    });
+    this.stageSubmitting = false;
+    if (resp.ok) { window.location.reload(); }
+    else { const d = await resp.json(); this.stageError = d.error || 'Failed to add stage.'; }
+  },
+  async deleteStage(id) {
+    if (!confirm('Delete this workflow stage?')) return;
+    await fetch('/compass/docgen/template-workflow-stages/' + id + '/', { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } });
+    window.location.reload();
+  }
+}">
+
+  <!-- Header info strip -->
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 px-6 py-4 mb-5 flex flex-wrap items-center gap-4">
+    <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium
+                 {% if template.status == 'PUBLISHED' %}bg-green-100 text-green-700
+                 {% elif template.status == 'DRAFT' %}bg-slate-100 text-slate-600
+                 {% else %}bg-gray-100 text-gray-500{% endif %}">
+      {{ template.status }}
+    </span>
+    <span class="text-sm text-slate-500">Code: <strong class="font-mono text-slate-700">{{ template.code }}</strong></span>
+    {% if template.category %}<span class="text-sm text-slate-500">Category: <strong class="text-slate-700">{{ template.category }}</strong></span>{% endif %}
+    <span class="text-sm text-slate-500">Revision: <strong class="text-slate-700">v{{ current_revision.version }}</strong>
+      <span class="ml-1 text-xs px-2 py-0.5 rounded font-medium
+                   {% if current_revision.status == 'PUBLISHED' %}bg-green-100 text-green-700
+                   {% elif current_revision.status == 'DRAFT' %}bg-amber-100 text-amber-700
+                   {% else %}bg-gray-100 text-gray-500{% endif %}">
+        {{ current_revision.status }}
+      </span>
+    </span>
+  </div>
+
+  <!-- Tabs -->
+  <div class="flex gap-1 mb-5 border-b border-slate-200">
+    <button @click="activeTab = 'placeholders'"
+            :class="activeTab === 'placeholders' ? 'border-b-2 border-compass-600 text-compass-700 font-medium' : 'text-slate-500 hover:text-slate-700'"
+            class="px-4 py-2.5 text-sm transition-colors -mb-px">
+      Fields / Placeholders ({{ placeholders|length }})
+    </button>
+    <button @click="activeTab = 'workflow'"
+            :class="activeTab === 'workflow' ? 'border-b-2 border-compass-600 text-compass-700 font-medium' : 'text-slate-500 hover:text-slate-700'"
+            class="px-4 py-2.5 text-sm transition-colors -mb-px">
+      Workflow Stages ({{ stages|length }})
+    </button>
+    <button @click="activeTab = 'revisions'"
+            :class="activeTab === 'revisions' ? 'border-b-2 border-compass-600 text-compass-700 font-medium' : 'text-slate-500 hover:text-slate-700'"
+            class="px-4 py-2.5 text-sm transition-colors -mb-px">
+      All Revisions
+    </button>
+  </div>
+
+  <!-- TAB: Placeholders -->
+  <div x-show="activeTab === 'placeholders'">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+        <h2 class="font-semibold text-slate-700">Fields / Placeholders</h2>
+        {% if current_revision.status == 'DRAFT' %}
+          <button @click="phModal = true"
+                  class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg">
+            + Add Field
+          </button>
+        {% endif %}
+      </div>
+      {% if placeholders %}
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-slate-200 bg-slate-50 text-left">
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">#</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Name</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Label</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Type</th>
+              <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Required</th>
+              {% if current_revision.status == 'DRAFT' %}<th class="px-4 py-3"></th>{% endif %}
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            {% for ph in placeholders %}
+            <tr class="hover:bg-slate-50">
+              <td class="px-4 py-3 text-slate-500 text-xs">{{ ph.display_order }}</td>
+              <td class="px-4 py-3 font-mono text-xs text-slate-700">{{ ph.name }}</td>
+              <td class="px-4 py-3 font-medium text-slate-800">{{ ph.label }}</td>
+              <td class="px-4 py-3 text-slate-600">{{ ph.field_type }}</td>
+              <td class="px-4 py-3">
+                {% if ph.is_required %}
+                  <span class="text-xs bg-red-100 text-red-700 px-1.5 py-0.5 rounded font-medium">Yes</span>
+                {% else %}
+                  <span class="text-xs text-slate-400">No</span>
+                {% endif %}
+              </td>
+              {% if current_revision.status == 'DRAFT' %}
+              <td class="px-4 py-3 text-right">
+                <button @click="deletePlaceholder({{ ph.id }})" class="text-xs text-red-400 hover:text-red-600">Delete</button>
+              </td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="px-5 py-8 text-center text-slate-400 text-sm">No fields defined yet.
+          {% if current_revision.status == 'DRAFT' %}Add a field to get started.{% endif %}
+        </p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- TAB: Workflow Stages -->
+  <div x-show="activeTab === 'workflow'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+        <h2 class="font-semibold text-slate-700">Workflow Stages</h2>
+        {% if current_revision.status == 'DRAFT' %}
+          <button @click="stageModal = true"
+                  class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg">
+            + Add Stage
+          </button>
+        {% endif %}
+      </div>
+      {% if stages %}
+        <div class="divide-y divide-slate-100">
+          {% for stage in stages %}
+          <div class="px-5 py-4 flex items-start gap-4">
+            <div class="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-sm font-bold bg-compass-100 text-compass-700 mt-0.5">
+              {{ stage.stage_order }}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <p class="font-medium text-slate-800">{{ stage.title }}</p>
+                <span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">{{ stage.mode }}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-medium">{{ stage.required_action }}</span>
+                {% if stage.is_mandatory %}<span class="text-xs text-red-500">Mandatory</span>{% endif %}
+              </div>
+              <p class="text-xs text-slate-500 mt-1">
+                Actor: <strong>{{ stage.actor_type }}</strong> = <code>{{ stage.actor_value }}</code>
+                {% if stage.sla_hours %} &bull; SLA: {{ stage.sla_hours }}h{% endif %}
+              </p>
+            </div>
+            {% if current_revision.status == 'DRAFT' %}
+            <button @click="deleteStage({{ stage.id }})" class="text-xs text-red-400 hover:text-red-600 shrink-0">Delete</button>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="px-5 py-8 text-center text-slate-400 text-sm">No workflow stages defined.
+          {% if current_revision.status == 'DRAFT' %}Add stages to define the review/approval flow.{% endif %}
+        </p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- TAB: Revisions -->
+  <div x-show="activeTab === 'revisions'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-slate-200 bg-slate-50 text-left">
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Version</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Status</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Published At</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Created</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100">
+          {% for rev in revisions %}
+          <tr class="hover:bg-slate-50 {% if rev.id == current_revision.id %}bg-compass-50{% endif %}">
+            <td class="px-4 py-3 font-medium text-slate-800">v{{ rev.version }} {% if rev.id == current_revision.id %}<span class="text-xs text-compass-600">(current)</span>{% endif %}</td>
+            <td class="px-4 py-3">
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                           {% if rev.status == 'PUBLISHED' %}bg-green-100 text-green-700
+                           {% elif rev.status == 'DRAFT' %}bg-amber-100 text-amber-700
+                           {% else %}bg-gray-100 text-gray-500{% endif %}">
+                {{ rev.status }}
+              </span>
+            </td>
+            <td class="px-4 py-3 text-slate-500 text-xs">{{ rev.published_at|date:"d M Y H:i"|default:"—" }}</td>
+            <td class="px-4 py-3 text-slate-500 text-xs">{{ rev.created_at|date:"d M Y" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- ========== MODALS ========== -->
+
+<!-- Add Placeholder modal -->
+<div x-data x-show="$store.tpl?.phModal" x-cloak></div>
+<!-- inline modal triggered from parent x-data -->
+<div x-show="false" id="ph-modal-anchor"></div>
+
+<div x-data="{
+  get show() { return document.querySelector('[x-data]')?.__x?.$data?.phModal; }
+}"></div>
+
+<!-- Use a single root data context since base x-data wraps everything -->
+<template>
+  <!-- Placeholder modal rendered within the outer x-data div above -->
+</template>
+
+<!-- Rendered directly since they share the outer x-data scope -->
+<div x-show="phModal" x-cloak x-transition
+     style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
+  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-5">Add Field</h3>
+    <template x-if="phError">
+      <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="phError"></div>
+    </template>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Name <span class="text-red-400">*</span></label>
+          <input type="text" x-model="phForm.name" placeholder="recipient"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none font-mono" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Label <span class="text-red-400">*</span></label>
+          <input type="text" x-model="phForm.label" placeholder="Recipient"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Field Type</label>
+          <select x-model="phForm.field_type"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            {% for ft in field_type_choices %}
+              <option value="{{ ft }}">{{ ft }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Display Order</label>
+          <input type="number" x-model="phForm.display_order" min="1"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <input type="checkbox" id="ph-required" x-model="phForm.is_required"
+               class="w-4 h-4 accent-compass-600 rounded" />
+        <label for="ph-required" class="text-sm text-slate-700">Required field</label>
+      </div>
+    </div>
+    <div class="flex gap-3 justify-end mt-6">
+      <button @click="phModal = false; phError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="savePlaceholder()" :disabled="phSubmitting"
+              class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
+        <span x-text="phSubmitting ? 'Adding…' : 'Add Field'"></span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Stage modal -->
+<div x-show="stageModal" x-cloak x-transition
+     style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
+  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
+    <h3 class="font-semibold text-slate-800 mb-5">Add Workflow Stage</h3>
+    <template x-if="stageError">
+      <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="stageError"></div>
+    </template>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Stage Order</label>
+          <input type="number" x-model="stageForm.stage_order" min="1"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Title <span class="text-red-400">*</span></label>
+          <input type="text" x-model="stageForm.title" placeholder="Initial Review"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Mode</label>
+          <select x-model="stageForm.mode"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            <option value="SEQUENTIAL">SEQUENTIAL</option>
+            <option value="PARALLEL_ALL">PARALLEL_ALL</option>
+            <option value="PARALLEL_ANY">PARALLEL_ANY</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Required Action</label>
+          <select x-model="stageForm.required_action"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            {% for act in action_choices %}
+              <option value="{{ act }}">{{ act }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Actor Type</label>
+          <select x-model="stageForm.actor_type"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            <option value="USER">USER</option>
+            <option value="ROLE">ROLE</option>
+            <option value="POSITION">POSITION</option>
+            <option value="DYNAMIC">DYNAMIC</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Actor Value</label>
+          <input type="text" x-model="stageForm.actor_value" placeholder="reviewer"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">SLA Hours</label>
+        <input type="number" x-model="stageForm.sla_hours" min="1"
+               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+      </div>
+      <div class="flex items-center gap-2">
+        <input type="checkbox" id="stage-mandatory" x-model="stageForm.is_mandatory"
+               class="w-4 h-4 accent-compass-600 rounded" />
+        <label for="stage-mandatory" class="text-sm text-slate-700">Mandatory stage</label>
+      </div>
+    </div>
+    <div class="flex gap-3 justify-end mt-6">
+      <button @click="stageModal = false; stageError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+      <button @click="saveStage()" :disabled="stageSubmitting"
+              class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
+        <span x-text="stageSubmitting ? 'Adding…' : 'Add Stage'"></span>
+      </button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
