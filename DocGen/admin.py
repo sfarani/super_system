@@ -7,6 +7,7 @@ from .models import (
 	DocumentRevision,
 	DocumentWorkflowStage,
 	ReferenceNumberSequence,
+	RetentionPolicy,
 	Template,
 	TemplateCategory,
 	TemplatePlaceholder,
@@ -56,6 +57,7 @@ class DocumentAdmin(admin.ModelAdmin):
 		"document_type",
 		"status",
 		"reference_number",
+		"archived_at",
 		"originator",
 		"created_at",
 	)
@@ -97,3 +99,10 @@ class DocumentPDFAdmin(admin.ModelAdmin):
 class ReferenceNumberSequenceAdmin(admin.ModelAdmin):
 	list_display = ("doc_type_code", "year", "current_value")
 	list_filter = ("year", "doc_type_code")
+
+
+@admin.register(RetentionPolicy)
+class RetentionPolicyAdmin(admin.ModelAdmin):
+	list_display = ("name", "archive_retention_days", "is_active", "updated_at")
+	list_filter = ("is_active",)
+	search_fields = ("name",)

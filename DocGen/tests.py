@@ -2,20 +2,30 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.test.utils import override_settings
 from datetime import timedelta
 import json
+from unittest.mock import patch
 
+from .adapters import CompassActorResolutionAdapter
 from .models import (
 	Document,
 	DocumentQRToken,
 	DocumentType,
 	DocumentWorkflowStage,
+	RetentionPolicy,
 	Template,
 	TemplateCategory,
 	TemplateRevision,
 	TemplateWorkflowStage,
 )
+
+
+class CustomActorResolutionAdapter:
+	def resolve(self, actor_type: str, actor_value: str, document) -> str:
+		return f"custom:{actor_type.lower()}:{actor_value}"
 
 
 class DocGenModelTests(TestCase):
@@ -464,6 +474,9 @@ class DocumentApiTests(TestCase):
 		pdf = document.pdf_versions.first()
 		self.assertTrue(pdf.is_active)
 		self.assertEqual(len(pdf.sha256_hash), 64)
+		with pdf.file.open("rb") as generated_pdf:
+			header = generated_pdf.read(5)
+		self.assertEqual(header, b"%PDF-")
 		self.assertEqual(response_data["pdf_version"], 1)
 		self.assertEqual(response_data["pdf_sha256"], pdf.sha256_hash)
 
@@ -513,8 +526,10 @@ class DocumentApiTests(TestCase):
 			content_type="application/json",
 		)
 		self.assertEqual(archive_response.status_code, 200)
+		self.assertIsNotNone(archive_response.json().get("archived_at"))
 		document.refresh_from_db()
 		self.assertEqual(document.status, "ARCHIVED")
+		self.assertIsNotNone(document.archived_at)
 
 	def test_archive_after_retention_window_succeeds(self):
 		document = self._create_finalized_document()
@@ -527,6 +542,71 @@ class DocumentApiTests(TestCase):
 		self.assertEqual(archive_response.status_code, 200, archive_response.content.decode())
 		document.refresh_from_db()
 		self.assertEqual(document.status, "ARCHIVED")
+
+	def test_archive_uses_active_retention_policy(self):
+		RetentionPolicy.objects.create(name="strict", archive_retention_days=30, is_active=True)
+		document = self._create_finalized_document()
+		document.finalized_at = timezone.now() - timedelta(days=31)
+		document.save(update_fields=["finalized_at", "updated_at"])
+
+		archive_response = self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": document.id})
+		)
+		self.assertEqual(archive_response.status_code, 200)
+		self.assertEqual(archive_response.json()["retention_days"], 30)
+
+	def test_archive_collection_lists_archived_documents(self):
+		archived_document = self._create_finalized_document()
+		archive_response = self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": archived_document.id}),
+			data=json.dumps({"force": True}),
+			content_type="application/json",
+		)
+		self.assertEqual(archive_response.status_code, 200)
+
+		response = self.client.get(reverse("docgen:document-archive-collection"))
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["results"][0]["id"], archived_document.id)
+
+	def test_archive_collection_supports_search_filter(self):
+		first_document = self._create_finalized_document()
+		self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": first_document.id}),
+			data=json.dumps({"force": True}),
+			content_type="application/json",
+		)
+
+		second_document = self._create_submitted_document()
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": second_document.id, "action": "review"}),
+			data=json.dumps({"comment": "Reviewed"}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-action", kwargs={"document_id": second_document.id, "action": "approve"}),
+			data=json.dumps({"comment": "Approved"}),
+			content_type="application/json",
+		)
+		self.client.post(
+			reverse("docgen:document-finalize", kwargs={"document_id": second_document.id})
+		)
+		second_document.refresh_from_db()
+		self.client.post(
+			reverse("docgen:document-archive", kwargs={"document_id": second_document.id}),
+			data=json.dumps({"force": True}),
+			content_type="application/json",
+		)
+
+		response = self.client.get(
+			reverse("docgen:document-archive-collection"),
+			{"q": first_document.reference_number},
+		)
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(data["count"], 1)
+		self.assertEqual(data["results"][0]["id"], first_document.id)
 
 	def test_submit_resolves_role_actor_value(self):
 		document = Document.objects.create(
@@ -655,6 +735,35 @@ class DocumentApiTests(TestCase):
 		stage2 = document.workflow_stages.filter(stage_order=2).first()
 		self.assertEqual(stage2.status, "DRAFT")
 
+	@override_settings(DOCGEN_ACTOR_RESOLUTION_ADAPTER="DocGen.tests.CustomActorResolutionAdapter")
+	def test_submit_uses_configured_actor_resolution_adapter(self):
+		document = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Configured Adapter Resolution",
+		)
+		response = self.client.post(reverse("docgen:document-submit", kwargs={"document_id": document.id}))
+		self.assertEqual(response.status_code, 200)
+		first_stage = document.workflow_stages.order_by("stage_order", "id").first()
+		self.assertEqual(first_stage.actor_value, "custom:role:reviewer")
+
+	def test_compass_adapter_extracts_dynamic_manager_actor(self):
+		originator = get_user_model().objects.create_user(username="originator_user", password="testpass123")
+		document = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Dynamic Manager Resolution",
+			originator=originator,
+		)
+		adapter = CompassActorResolutionAdapter()
+		with patch.object(adapter, "_request_json", return_value={"data": {"username": "manager_user"}}):
+			resolved = adapter.resolve(
+				actor_type="DYNAMIC",
+				actor_value="N+1_OF_ORIGINATOR",
+				document=document,
+			)
+		self.assertEqual(resolved, "manager_user")
+
 
 class DocGenRbacTests(TestCase):
 	@override_settings(DOCGEN_ENFORCE_RBAC=True)
@@ -671,6 +780,43 @@ class DocGenRbacTests(TestCase):
 			content_type="application/json",
 		)
 		self.assertEqual(response.status_code, 403)
+
+	@override_settings(DOCGEN_ENFORCE_RBAC=True)
+	def test_authenticated_template_create_forbidden_without_permission(self):
+		category = TemplateCategory.objects.create(name="RBAC Category 2", slug="rbac-category-2")
+		user = get_user_model().objects.create_user(username="rbac_no_perm", password="testpass123")
+		self.client.force_login(user)
+		payload = {
+			"category_id": category.id,
+			"title": "Blocked Template 2",
+			"code": "BLOCKED_TEMPLATE_2",
+		}
+		response = self.client.post(
+			reverse("docgen:template-collection"),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 403)
+
+	@override_settings(DOCGEN_ENFORCE_RBAC=True)
+	def test_authenticated_template_create_allowed_with_permission(self):
+		category = TemplateCategory.objects.create(name="RBAC Category 3", slug="rbac-category-3")
+		user = get_user_model().objects.create_user(username="rbac_author", password="testpass123")
+		permission = Permission.objects.get(codename="template_author")
+		user.user_permissions.add(permission)
+		self.client.force_login(user)
+
+		payload = {
+			"category_id": category.id,
+			"title": "Allowed Template",
+			"code": "ALLOWED_TEMPLATE",
+		}
+		response = self.client.post(
+			reverse("docgen:template-collection"),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 201)
 
 
 class TemplateStructureApiTests(TestCase):

@@ -22,4 +22,5 @@ urlpatterns = [
     path("documents/<int:document_id>/timeline/", views.document_timeline, name="document-timeline"),
     path("documents/<int:document_id>/finalize/", views.document_finalize, name="document-finalize"),
     path("documents/<int:document_id>/archive/", views.document_archive, name="document-archive"),
+    path("documents/archive/", views.document_archive_collection, name="document-archive-collection"),
 ]

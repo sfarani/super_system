@@ -162,6 +162,7 @@ Base prefix: /compass/docgen/
 
 - POST /documents/{document_id}/finalize/
   - Purpose: transition APPROVED document to FINALIZED, issue QR token, and persist a hashed PDF artifact record
+  - Rendering: document data is rendered into HTML and converted to a binary PDF via xhtml2pdf
   - Guard: document must be in APPROVED status
   - Response:
     {
@@ -188,7 +189,34 @@ Base prefix: /compass/docgen/
       "document_id": 1,
       "status": "ARCHIVED",
       "retention_days": 365,
-      "forced": false
+      "forced": false,
+      "archived_at": "2026-05-23T18:22:11Z"
+    }
+
+- GET /documents/archive/
+  - Purpose: list archived documents with query filters
+  - Query params (optional):
+    - q: partial match on reference number or title
+    - document_type: exact enum match
+    - archived_after: ISO datetime
+    - archived_before: ISO datetime
+    - limit: max rows (default 50, max 200)
+  - Response:
+    {
+      "count": 1,
+      "retention_days": 365,
+      "results": [
+        {
+          "id": 10,
+          "title": "Memo for Review",
+          "reference_number": "COMPASS/HQ/MEM/2026/00001",
+          "document_type": "MEMORANDUM",
+          "status": "ARCHIVED",
+          "archived_at": "2026-05-23T18:22:11Z",
+          "finalized_at": "2026-05-20T09:10:00Z",
+          "template_revision": 5
+        }
+      ]
     }
 
 ## RBAC Enforcement Flag
@@ -197,13 +225,57 @@ Base prefix: /compass/docgen/
 - Location: super_system/settings.py
 - Behavior:
   - False: API works without role enforcement (dev bootstrap mode)
-  - True: mutating endpoints require DocGen roles/groups
-    - Template author/publisher/admin for template write operations
-    - Originator/admin for document create/update/submit
-    - Reviewer/approver/admin for workflow actions
+  - True: mutating endpoints require formal Django permissions via user or group assignments
+    - Required codenames:
+      - template_author
+      - template_publisher
+      - admin
+      - originator
+      - reviewer
+      - approver
+    - Mapping by endpoint class:
+      - Template write operations: template_author or template_publisher or admin
+      - Document create/update/submit: originator or admin
+      - Workflow actions: reviewer or approver or admin
 
   ## Archive Retention Setting
 
   - Setting: DOCGEN_DEFAULT_ARCHIVE_DAYS (default 365)
   - Location: super_system/settings.py
-  - Use: default retention window before finalized documents are archive-eligible
+  - Use: fallback retention window before finalized documents are archive-eligible
+
+## Retention Policy Admin Control
+
+- Model: RetentionPolicy
+- Location: Django admin (DocGen app)
+- Fields:
+  - name (unique)
+  - archive_retention_days (>0)
+  - is_active
+- Runtime behavior:
+  - If an active RetentionPolicy exists, its archive_retention_days overrides DOCGEN_DEFAULT_ARCHIVE_DAYS.
+  - If no active RetentionPolicy exists, DOCGEN_DEFAULT_ARCHIVE_DAYS is used.
+
+## Actor Resolution Adapters
+
+- Submit-time workflow actor resolution is adapter-driven.
+- Setting: DOCGEN_ACTOR_RESOLUTION_ADAPTER
+  - Default: DocGen.adapters.LocalActorResolutionAdapter
+  - Purpose: allows swapping actor resolution to COMPASS-integrated adapters without changing workflow submit logic.
+
+- Built-in adapters:
+  - DocGen.adapters.LocalActorResolutionAdapter
+    - USER -> actor_value
+    - ROLE -> role:{actor_value}
+    - POSITION -> position:{actor_value}
+    - DYNAMIC + N+1_OF_ORIGINATOR -> dynamic:n+1:{originator_id}
+  - DocGen.adapters.CompassActorResolutionAdapter
+    - Uses COMPASS directory/org-chart APIs when configured and falls back to local mapping on failure.
+
+- COMPASS adapter settings:
+  - DOCGEN_COMPASS_DIRECTORY_USER_URL
+  - DOCGEN_COMPASS_ORGCHART_ROLE_URL
+  - DOCGEN_COMPASS_ORGCHART_POSITION_URL
+  - DOCGEN_COMPASS_ORGCHART_MANAGER_URL
+  - DOCGEN_COMPASS_API_TIMEOUT_SECONDS
+  - DOCGEN_COMPASS_API_TOKEN

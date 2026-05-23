@@ -161,10 +161,10 @@ Exit Criteria:
 - Reporting endpoints provide actionable metrics.
 
 ## Immediate Next Sprint Tasks
-1. Strengthen permission mapping from groups to formal Django permissions for production rollout.
-2. Replace PDF stub generation with real HTML-to-PDF rendering pipeline and storage adapters.
-3. Implement actor-resolution adapters against COMPASS directory/org-chart services.
-4. Add archive listing/query APIs and retention-policy admin controls.
+1. Strengthen permission mapping from groups to formal Django permissions for production rollout. (Completed)
+2. Replace PDF stub generation with real HTML-to-PDF rendering pipeline and storage adapters. (Completed)
+3. Implement actor-resolution adapters against COMPASS directory/org-chart services. (Completed)
+4. Add archive listing/query APIs and retention-policy admin controls. (Completed)
 5. Defer SLA reminder/escalation Celery tasks to COMPASS integration stage (as agreed).
 
 ## Definition of Done per Phase

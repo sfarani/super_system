@@ -116,6 +116,11 @@ class Template(TimeStampedModel):
 
 	class Meta:
 		ordering = ["title"]
+		permissions = [
+			("template_author", "Can author DocGen templates"),
+			("template_publisher", "Can publish and retire DocGen templates"),
+			("admin", "Can administer DocGen operations"),
+		]
 
 	def __str__(self):
 		return f"{self.code} - {self.title}"
@@ -345,6 +350,7 @@ class Document(TimeStampedModel):
 	submitted_at = models.DateTimeField(null=True, blank=True)
 	approved_at = models.DateTimeField(null=True, blank=True)
 	finalized_at = models.DateTimeField(null=True, blank=True)
+	archived_at = models.DateTimeField(null=True, blank=True)
 	supersedes = models.ForeignKey(
 		"self",
 		on_delete=models.SET_NULL,
@@ -355,6 +361,11 @@ class Document(TimeStampedModel):
 
 	class Meta:
 		ordering = ["-created_at"]
+		permissions = [
+			("originator", "Can create and submit DocGen documents"),
+			("reviewer", "Can review DocGen workflow stages"),
+			("approver", "Can approve and finalize DocGen documents"),
+		]
 
 	def __str__(self):
 		return self.reference_number or f"Draft #{self.pk}"
@@ -517,3 +528,25 @@ class DocumentPDF(TimeStampedModel):
 
 	def __str__(self):
 		return f"PDF<{self.document_id}> v{self.version}"
+
+
+class RetentionPolicy(TimeStampedModel):
+	name = models.CharField(max_length=80, unique=True, default="default")
+	archive_retention_days = models.PositiveIntegerField(
+		default=365,
+		validators=[MinValueValidator(1)],
+	)
+	is_active = models.BooleanField(default=True)
+
+	class Meta:
+		ordering = ["-is_active", "name"]
+
+	def __str__(self):
+		return f"{self.name} ({self.archive_retention_days} days)"
+
+	@classmethod
+	def get_active_days(cls) -> int | None:
+		active = cls.objects.filter(is_active=True).order_by("id").first()
+		if active is None:
+			return None
+		return active.archive_retention_days

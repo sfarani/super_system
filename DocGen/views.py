@@ -8,9 +8,11 @@ from django.conf import settings as django_settings
 from django.core import signing
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
+from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
+from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_http_methods
 
@@ -21,6 +23,7 @@ from .models import (
 	DocumentRevision,
 	DocumentStatus,
 	DocumentWorkflowStage,
+	RetentionPolicy,
 	Template,
 	TemplateCategory,
 	TemplatePlaceholder,
@@ -28,7 +31,18 @@ from .models import (
 	TemplateStatus,
 	TemplateWorkflowStage,
 )
-from .services import generate_pdf_artifact_stub, resolve_workflow_actor
+from .services import generate_pdf_artifact, resolve_workflow_actor
+
+
+_DOCGEN_PERMISSION_PREFIX = f"{Template._meta.app_label}."
+_DOCGEN_ROLE_PERMISSIONS = {
+	"docgen.originator": f"{_DOCGEN_PERMISSION_PREFIX}originator",
+	"docgen.reviewer": f"{_DOCGEN_PERMISSION_PREFIX}reviewer",
+	"docgen.approver": f"{_DOCGEN_PERMISSION_PREFIX}approver",
+	"docgen.template_author": f"{_DOCGEN_PERMISSION_PREFIX}template_author",
+	"docgen.template_publisher": f"{_DOCGEN_PERMISSION_PREFIX}template_publisher",
+	"docgen.admin": f"{_DOCGEN_PERMISSION_PREFIX}admin",
+}
 
 
 def _parse_json_request(request):
@@ -109,21 +123,8 @@ def _has_docgen_role(user, allowed_roles) -> bool:
 		return False
 	if user.is_superuser:
 		return True
-
-	group_names = set(user.groups.values_list("name", flat=True))
-	if any(role in group_names for role in allowed_roles):
-		return True
-
-	permission_names = {
-		"docgen.originator": "DocGen.originator",
-		"docgen.reviewer": "DocGen.reviewer",
-		"docgen.approver": "DocGen.approver",
-		"docgen.template_author": "DocGen.template_author",
-		"docgen.template_publisher": "DocGen.template_publisher",
-		"docgen.admin": "DocGen.admin",
-	}
 	for role in allowed_roles:
-		permission = permission_names.get(role)
+		permission = _DOCGEN_ROLE_PERMISSIONS.get(role)
 		if permission and user.has_perm(permission):
 			return True
 	return False
@@ -136,7 +137,18 @@ def _authorize_docgen_action(request, allowed_roles):
 
 
 def _archive_retention_days() -> int:
+	policy_days = RetentionPolicy.get_active_days()
+	if policy_days is not None:
+		return int(policy_days)
 	return int(getattr(django_settings, "DOCGEN_DEFAULT_ARCHIVE_DAYS", 365))
+
+
+def _coerce_positive_int(value, default: int, max_value: int) -> int:
+	try:
+		parsed = int(value)
+	except (TypeError, ValueError):
+		return default
+	return max(1, min(parsed, max_value))
 
 
 def _issue_or_get_qr_token(document: Document) -> DocumentQRToken:
@@ -822,7 +834,7 @@ def document_finalize(request, document_id: int):
 	)
 	document.save(update_fields=["status", "finalized_at", "metadata", "updated_at"])
 	qr = _issue_or_get_qr_token(document)
-	pdf = generate_pdf_artifact_stub(
+	pdf = generate_pdf_artifact(
 		document=document,
 		generated_by=request.user if request.user.is_authenticated else None,
 	)
@@ -853,7 +865,15 @@ def document_archive(request, document_id: int):
 
 	document = get_object_or_404(Document, pk=document_id)
 	if document.status == DocumentStatus.ARCHIVED:
-		return JsonResponse({"document_id": document.id, "status": document.status})
+		return JsonResponse(
+			{
+				"document_id": document.id,
+				"status": document.status,
+				"retention_days": _archive_retention_days(),
+				"forced": False,
+				"archived_at": document.archived_at,
+			}
+		)
 	if document.status != DocumentStatus.FINALIZED:
 		return JsonResponse({"error": "Only finalized documents can be archived."}, status=400)
 
@@ -881,13 +901,14 @@ def document_archive(request, document_id: int):
 			)
 
 	document.status = DocumentStatus.ARCHIVED
+	document.archived_at = timezone.now()
 	_append_document_event(
 		document=document,
 		action="archive",
 		actor=request.user if request.user.is_authenticated else None,
 		comment="forced" if force else "",
 	)
-	document.save(update_fields=["status", "metadata", "updated_at"])
+	document.save(update_fields=["status", "archived_at", "metadata", "updated_at"])
 	_snapshot_document(document, actor=request.user if request.user.is_authenticated else None)
 
 	return JsonResponse(
@@ -896,6 +917,66 @@ def document_archive(request, document_id: int):
 			"status": document.status,
 			"retention_days": retention_days,
 			"forced": force,
+			"archived_at": document.archived_at,
+		}
+	)
+
+
+@require_GET
+def document_archive_collection(request):
+	auth_error = _authorize_docgen_action(
+		request,
+		{"docgen.admin"},
+	)
+	if auth_error is not None:
+		return auth_error
+
+	queryset = Document.objects.filter(status=DocumentStatus.ARCHIVED).select_related("template_revision")
+
+	search = (request.GET.get("q") or "").strip()
+	if search:
+		queryset = queryset.filter(Q(reference_number__icontains=search) | Q(title__icontains=search))
+
+	document_type = request.GET.get("document_type")
+	if document_type:
+		queryset = queryset.filter(document_type=document_type)
+
+	archived_after = request.GET.get("archived_after")
+	if archived_after:
+		parsed_after = parse_datetime(archived_after)
+		if parsed_after is None:
+			return JsonResponse({"error": "archived_after must be a valid ISO datetime."}, status=400)
+		queryset = queryset.filter(archived_at__gte=parsed_after)
+
+	archived_before = request.GET.get("archived_before")
+	if archived_before:
+		parsed_before = parse_datetime(archived_before)
+		if parsed_before is None:
+			return JsonResponse({"error": "archived_before must be a valid ISO datetime."}, status=400)
+		queryset = queryset.filter(archived_at__lte=parsed_before)
+
+	limit = _coerce_positive_int(request.GET.get("limit"), default=50, max_value=200)
+	documents = list(queryset.order_by("-archived_at", "-id")[:limit])
+
+	results = [
+		{
+			"id": document.id,
+			"title": document.title,
+			"reference_number": document.reference_number,
+			"document_type": document.document_type,
+			"status": document.status,
+			"archived_at": document.archived_at,
+			"finalized_at": document.finalized_at,
+			"template_revision": document.template_revision.version,
+		}
+		for document in documents
+	]
+
+	return JsonResponse(
+		{
+			"count": len(results),
+			"results": results,
+			"retention_days": _archive_retention_days(),
 		}
 	)
 
