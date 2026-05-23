@@ -73,7 +73,110 @@
     if (!confirm('Delete this workflow stage?')) return;
     await fetch('/compass/docgen/template-workflow-stages/' + id + '/', { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } });
     window.location.reload();
-  }
+  },
+
+  /* ---- Layout Builder ---- */
+  builderLoaded: false,
+  builderLoading: false,
+  builderSaving: false,
+  builderDirty: false,
+  builderError: '',
+  builderSuccess: '',
+  builderPreviewOpen: false,
+  pageSetup: { paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25 },
+  blocks: [],
+  BLOCK_TYPES: [
+    { type: 'letterhead',      label: 'Letterhead',    hint: 'Org name, address, branding' },
+    { type: 'reference_line',  label: 'Reference Line', hint: 'Ref no. and date' },
+    { type: 'subject_line',    label: 'Subject',        hint: 'Subject heading' },
+    { type: 'salutation',      label: 'Salutation',     hint: 'Opening greeting' },
+    { type: 'body',            label: 'Body',           hint: 'Main body paragraph' },
+    { type: 'closing',         label: 'Closing',        hint: 'Closing paragraph' },
+    { type: 'signature_block', label: 'Signature',      hint: 'Signatory block' },
+    { type: 'footer',          label: 'Footer',         hint: 'Page footer text' },
+    { type: 'custom',          label: 'Custom Block',   hint: 'Freeform content' },
+  ],
+  DEFAULT_CONTENT: {
+    letterhead:      'GOVERNMENT OF PAKISTAN\n[Ministry / Department Name]\n[City]',
+    reference_line:  'No. [reference_number]\nDated: [date]',
+    subject_line:    'Subject: [subject]',
+    salutation:      'Dear [recipient],',
+    body:            '[body_text]',
+    closing:         'Yours sincerely,',
+    signature_block: '[signatory_name]\n[signatory_designation]\nDate: [approval_date]',
+    footer:          '[reference_number] | COMPASS eOffice',
+    custom:          '',
+  },
+  layoutUrl: '{% if current_revision %}{% url "docgen:template-revision-layout" revision_id=current_revision.id %}{% else %}{% endif %}',
+  init() {
+    this.$watch('activeTab', (tab) => {
+      if (tab === 'builder' && !this.builderLoaded) this.loadLayout();
+    });
+  },
+  async loadLayout() {
+    if (!this.layoutUrl) return;
+    this.builderLoading = true;
+    const resp = await fetch(this.layoutUrl);
+    if (resp.ok) {
+      const data = await resp.json();
+      const schema = data.layout_schema || {};
+      this.pageSetup = Object.assign(
+        { paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25 },
+        schema.page || {}
+      );
+      this.blocks = (schema.blocks || []).map(b => ({ ...b }));
+    }
+    this.builderLoading = false;
+    this.builderLoaded = true;
+  },
+  async saveLayout() {
+    if (!this.layoutUrl) return;
+    this.builderSaving = true; this.builderError = ''; this.builderSuccess = '';
+    const schema = { page: { ...this.pageSetup }, blocks: this.blocks.map(b => ({ ...b })) };
+    const resp = await fetch(this.layoutUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({ layout_schema: schema }),
+    });
+    this.builderSaving = false;
+    if (resp.ok) {
+      this.builderDirty = false;
+      this.builderSuccess = 'Layout saved successfully.';
+      setTimeout(() => this.builderSuccess = '', 3000);
+    } else {
+      const d = await resp.json().catch(() => ({}));
+      this.builderError = d.error || 'Save failed.';
+    }
+  },
+  addBlock(type) {
+    this.blocks.push({
+      id: 'b' + Date.now(),
+      type,
+      label: (this.BLOCK_TYPES.find(t => t.type === type) || {}).label || type,
+      content: this.DEFAULT_CONTENT[type] || '',
+      align: 'left',
+    });
+    this.builderDirty = true;
+  },
+  removeBlock(id) {
+    if (!confirm('Remove this block?')) return;
+    this.blocks = this.blocks.filter(b => b.id !== id);
+    this.builderDirty = true;
+  },
+  moveBlock(id, dir) {
+    const idx = this.blocks.findIndex(b => b.id === id);
+    if (dir === 'up' && idx > 0) {
+      [this.blocks[idx - 1], this.blocks[idx]] = [this.blocks[idx], this.blocks[idx - 1]];
+    }
+    if (dir === 'down' && idx < this.blocks.length - 1) {
+      [this.blocks[idx + 1], this.blocks[idx]] = [this.blocks[idx], this.blocks[idx + 1]];
+    }
+    this.builderDirty = true;
+  },
+  blockTypeLabel(type) {
+    const found = this.BLOCK_TYPES.find(t => t.type === type);
+    return found ? found.label : type;
+  },
 }">
 
   <!-- Header info strip -->
@@ -88,10 +191,9 @@
     {% if template.category %}<span class="text-sm text-slate-500">Category: <strong class="text-slate-700">{{ template.category }}</strong></span>{% endif %}
     <span class="text-sm text-slate-500">Revision: <strong class="text-slate-700">v{{ current_revision.version }}</strong>
       <span class="ml-1 text-xs px-2 py-0.5 rounded font-medium
-                   {% if current_revision.status == 'PUBLISHED' %}bg-green-100 text-green-700
-                   {% elif current_revision.status == 'DRAFT' %}bg-amber-100 text-amber-700
-                   {% else %}bg-gray-100 text-gray-500{% endif %}">
-        {{ current_revision.status }}
+                   {% if current_revision.is_published %}bg-green-100 text-green-700
+                   {% else %}bg-amber-100 text-amber-700{% endif %}">
+        {% if current_revision.is_published %}PUBLISHED{% else %}DRAFT{% endif %}
       </span>
     </span>
   </div>
@@ -113,6 +215,16 @@
             class="px-4 py-2.5 text-sm transition-colors -mb-px">
       All Revisions
     </button>
+    {% if current_revision and not current_revision.is_published %}
+    <button @click="activeTab = 'builder'"
+            :class="activeTab === 'builder' ? 'border-b-2 border-compass-600 text-compass-700 font-medium' : 'text-slate-500 hover:text-slate-700'"
+            class="px-4 py-2.5 text-sm transition-colors -mb-px flex items-center gap-1.5">
+      <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/>
+      </svg>
+      Layout Builder
+    </button>
+    {% endif %}
   </div>
 
   <!-- TAB: Placeholders -->
@@ -120,7 +232,7 @@
     <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
       <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
         <h2 class="font-semibold text-slate-700">Fields / Placeholders</h2>
-        {% if current_revision.status == 'DRAFT' %}
+        {% if not current_revision.is_published %}
           <button @click="phModal = true"
                   class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg">
             + Add Field
@@ -136,7 +248,7 @@
               <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Label</th>
               <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Type</th>
               <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Required</th>
-              {% if current_revision.status == 'DRAFT' %}<th class="px-4 py-3"></th>{% endif %}
+              {% if not current_revision.is_published %}<th class="px-4 py-3"></th>{% endif %}
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100">
@@ -153,7 +265,7 @@
                   <span class="text-xs text-slate-400">No</span>
                 {% endif %}
               </td>
-              {% if current_revision.status == 'DRAFT' %}
+              {% if not current_revision.is_published %}
               <td class="px-4 py-3 text-right">
                 <button @click="deletePlaceholder({{ ph.id }})" class="text-xs text-red-400 hover:text-red-600">Delete</button>
               </td>
@@ -164,7 +276,7 @@
         </table>
       {% else %}
         <p class="px-5 py-8 text-center text-slate-400 text-sm">No fields defined yet.
-          {% if current_revision.status == 'DRAFT' %}Add a field to get started.{% endif %}
+          {% if not current_revision.is_published %}Add a field to get started.{% endif %}
         </p>
       {% endif %}
     </div>
@@ -175,7 +287,7 @@
     <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
       <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
         <h2 class="font-semibold text-slate-700">Workflow Stages</h2>
-        {% if current_revision.status == 'DRAFT' %}
+        {% if not current_revision.is_published %}
           <button @click="stageModal = true"
                   class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg">
             + Add Stage
@@ -201,7 +313,7 @@
                 {% if stage.sla_hours %} &bull; SLA: {{ stage.sla_hours }}h{% endif %}
               </p>
             </div>
-            {% if current_revision.status == 'DRAFT' %}
+            {% if not current_revision.is_published %}
             <button @click="deleteStage({{ stage.id }})" class="text-xs text-red-400 hover:text-red-600 shrink-0">Delete</button>
             {% endif %}
           </div>
@@ -209,7 +321,7 @@
         </div>
       {% else %}
         <p class="px-5 py-8 text-center text-slate-400 text-sm">No workflow stages defined.
-          {% if current_revision.status == 'DRAFT' %}Add stages to define the review/approval flow.{% endif %}
+          {% if not current_revision.is_published %}Add stages to define the review/approval flow.{% endif %}
         </p>
       {% endif %}
     </div>
@@ -229,17 +341,16 @@
         </thead>
         <tbody class="divide-y divide-slate-100">
           {% for rev in revisions %}
-          <tr class="hover:bg-slate-50 {% if rev.id == current_revision.id %}bg-compass-50{% endif %}">
-            <td class="px-4 py-3 font-medium text-slate-800">v{{ rev.version }} {% if rev.id == current_revision.id %}<span class="text-xs text-compass-600">(current)</span>{% endif %}</td>
+          <tr class="hover:bg-slate-50 {% if current_revision and rev.id == current_revision.id %}bg-compass-50{% endif %}">
+            <td class="px-4 py-3 font-medium text-slate-800">v{{ rev.version }} {% if current_revision and rev.id == current_revision.id %}<span class="text-xs text-compass-600">(current)</span>{% endif %}</td>
             <td class="px-4 py-3">
               <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
-                           {% if rev.status == 'PUBLISHED' %}bg-green-100 text-green-700
-                           {% elif rev.status == 'DRAFT' %}bg-amber-100 text-amber-700
-                           {% else %}bg-gray-100 text-gray-500{% endif %}">
-                {{ rev.status }}
+                           {% if rev.is_published %}bg-green-100 text-green-700
+                           {% else %}bg-amber-100 text-amber-700{% endif %}">
+                {% if rev.is_published %}PUBLISHED{% else %}DRAFT{% endif %}
               </span>
             </td>
-            <td class="px-4 py-3 text-slate-500 text-xs">{{ rev.published_at|date:"d M Y H:i"|default:"—" }}</td>
+            <td class="px-4 py-3 text-slate-500 text-xs">{% if rev.is_published %}{{ rev.updated_at|date:"d M Y H:i" }}{% else %}—{% endif %}</td>
             <td class="px-4 py-3 text-slate-500 text-xs">{{ rev.created_at|date:"d M Y" }}</td>
           </tr>
           {% endfor %}
@@ -248,154 +359,360 @@
     </div>
   </div>
 
-</div>
+  {% if current_revision and not current_revision.is_published %}
+  <!-- TAB: Layout Builder -->
+  <div x-show="activeTab === 'builder'" x-cloak>
 
-<!-- ========== MODALS ========== -->
-
-<!-- Add Placeholder modal -->
-<div x-data x-show="$store.tpl?.phModal" x-cloak></div>
-<!-- inline modal triggered from parent x-data -->
-<div x-show="false" id="ph-modal-anchor"></div>
-
-<div x-data="{
-  get show() { return document.querySelector('[x-data]')?.__x?.$data?.phModal; }
-}"></div>
-
-<!-- Use a single root data context since base x-data wraps everything -->
-<template>
-  <!-- Placeholder modal rendered within the outer x-data div above -->
-</template>
-
-<!-- Rendered directly since they share the outer x-data scope -->
-<div x-show="phModal" x-cloak x-transition
-     style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
-  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
-    <h3 class="font-semibold text-slate-800 mb-5">Add Field</h3>
-    <template x-if="phError">
-      <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="phError"></div>
-    </template>
-    <div class="space-y-4">
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Name <span class="text-red-400">*</span></label>
-          <input type="text" x-model="phForm.name" placeholder="recipient"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none font-mono" />
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Label <span class="text-red-400">*</span></label>
-          <input type="text" x-model="phForm.label" placeholder="Recipient"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
-        </div>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Field Type</label>
-          <select x-model="phForm.field_type"
-                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
-            {% for ft in field_type_choices %}
-              <option value="{{ ft }}">{{ ft }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Display Order</label>
-          <input type="number" x-model="phForm.display_order" min="1"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
-        </div>
-      </div>
-      <div class="flex items-center gap-2">
-        <input type="checkbox" id="ph-required" x-model="phForm.is_required"
-               class="w-4 h-4 accent-compass-600 rounded" />
-        <label for="ph-required" class="text-sm text-slate-700">Required field</label>
-      </div>
+    <!-- Loading spinner -->
+    <div x-show="builderLoading" class="flex items-center justify-center py-16 text-slate-400 text-sm gap-2">
+      <svg class="animate-spin w-5 h-5 text-compass-600" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+      </svg>
+      Loading layout…
     </div>
-    <div class="flex gap-3 justify-end mt-6">
-      <button @click="phModal = false; phError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
-      <button @click="savePlaceholder()" :disabled="phSubmitting"
-              class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
-        <span x-text="phSubmitting ? 'Adding…' : 'Add Field'"></span>
-      </button>
+
+    <div x-show="!builderLoading">
+
+      <!-- Alerts -->
+      <template x-if="builderError">
+        <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="builderError"></div>
+      </template>
+      <template x-if="builderSuccess">
+        <div class="bg-green-50 border border-green-200 text-green-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="builderSuccess"></div>
+      </template>
+
+      <!-- Page Setup -->
+      <div class="bg-white rounded-xl shadow-sm border border-slate-100 px-5 py-4 mb-5">
+        <h3 class="text-sm font-semibold text-slate-700 mb-3">Page Setup</h3>
+        <div class="flex flex-wrap gap-4 items-end">
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Paper Size</label>
+            <select x-model="pageSetup.paper_size" @change="builderDirty = true"
+                    class="border border-slate-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:ring-2 focus:ring-compass-500 outline-none">
+              <option value="A4">A4</option>
+              <option value="Letter">Letter</option>
+              <option value="Legal">Legal</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Orientation</label>
+            <select x-model="pageSetup.orientation" @change="builderDirty = true"
+                    class="border border-slate-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:ring-2 focus:ring-compass-500 outline-none">
+              <option value="portrait">Portrait</option>
+              <option value="landscape">Landscape</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Top (mm)</label>
+            <input type="number" x-model.number="pageSetup.margin_top" @input="builderDirty = true" min="0" max="80"
+                   class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Bottom (mm)</label>
+            <input type="number" x-model.number="pageSetup.margin_bottom" @input="builderDirty = true" min="0" max="80"
+                   class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Left (mm)</label>
+            <input type="number" x-model.number="pageSetup.margin_left" @input="builderDirty = true" min="0" max="80"
+                   class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Right (mm)</label>
+            <input type="number" x-model.number="pageSetup.margin_right" @input="builderDirty = true" min="0" max="80"
+                   class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Two-column: palette + block list -->
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-5">
+
+        <!-- Left: block palette + token reference -->
+        <div class="lg:col-span-1 space-y-4">
+          <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-4">
+            <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Add Block</h3>
+            <div class="flex flex-col gap-1.5">
+              <template x-for="bt in BLOCK_TYPES" :key="bt.type">
+                <button @click="addBlock(bt.type)"
+                        class="text-left px-3 py-2 rounded-lg border border-slate-200 hover:border-compass-400 hover:bg-compass-50 text-sm transition-colors group">
+                  <span class="font-medium text-slate-700" x-text="bt.label"></span>
+                  <span class="block text-xs text-slate-400 group-hover:text-compass-600 truncate" x-text="bt.hint"></span>
+                </button>
+              </template>
+            </div>
+          </div>
+
+          {% if placeholders %}
+          <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-4">
+            <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Field Tokens</h3>
+            <p class="text-xs text-slate-400 mb-2">Click to copy. Use as <code class="bg-slate-100 px-0.5 rounded">{% templatetag openvariable %}name{% templatetag closevariable %}</code> in block content.</p>
+            <div class="flex flex-wrap gap-1">
+              {% for ph in placeholders %}
+              <span class="font-mono text-xs bg-amber-50 border border-amber-200 text-amber-700 px-1.5 py-0.5 rounded cursor-pointer hover:bg-amber-100"
+                    data-phname="{{ ph.name }}"
+                    @click="const n = $el.dataset.phname; navigator.clipboard?.writeText('{% templatetag openvariable %}' + n + '{% templatetag closevariable %}').then(() => { builderSuccess = 'Copied token.'; setTimeout(() => builderSuccess = '', 2000); })"
+                    title="{{ ph.label }} ({{ ph.field_type }})">{{ ph.name }}</span>
+              {% endfor %}
+            </div>
+          </div>
+          {% endif %}
+        </div>
+
+        <!-- Right: block list -->
+        <div class="lg:col-span-3">
+          <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+            <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 class="font-semibold text-slate-700">Document Layout</h3>
+                <p class="text-xs text-slate-400 mt-0.5">Blocks render top-to-bottom. Use <code class="bg-slate-100 px-0.5 rounded">{% templatetag openvariable %}field_name{% templatetag closevariable %}</code> tokens to inject field values.</p>
+              </div>
+              <div class="flex items-center gap-3">
+                <span x-show="builderDirty" class="text-xs text-amber-600 flex items-center gap-1">
+                  <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+                  </svg>
+                  Unsaved
+                </span>
+                <button @click="saveLayout()" :disabled="builderSaving || !builderDirty"
+                        class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-lg transition-colors">
+                  <span x-text="builderSaving ? 'Saving…' : 'Save Layout'"></span>
+                </button>
+              </div>
+            </div>
+
+            <!-- empty state -->
+            <div x-show="blocks.length === 0" class="px-5 py-12 text-center">
+              <svg class="w-10 h-10 mx-auto mb-3 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+              </svg>
+              <p class="text-sm font-medium text-slate-500">No blocks yet</p>
+              <p class="text-xs text-slate-400 mt-1">Add blocks from the palette to define the document layout.</p>
+            </div>
+
+            <!-- block list -->
+            <div class="divide-y divide-slate-100">
+              <template x-for="(block, idx) in blocks" :key="block.id">
+                <div class="p-4">
+                  <div class="flex items-center gap-2 mb-2">
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-compass-100 text-compass-700"
+                          x-text="blockTypeLabel(block.type)"></span>
+                    <select x-model="block.align" @change="builderDirty = true"
+                            class="text-xs border border-slate-200 rounded px-2 py-0.5 bg-white text-slate-600 focus:outline-none focus:ring-1 focus:ring-compass-400">
+                      <option value="left">Left</option>
+                      <option value="center">Center</option>
+                      <option value="right">Right</option>
+                    </select>
+                    <div class="ml-auto flex items-center gap-1">
+                      <button @click="moveBlock(block.id, 'up')" :disabled="idx === 0"
+                              title="Move up"
+                              class="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 disabled:opacity-25 disabled:cursor-not-allowed">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/></svg>
+                      </button>
+                      <button @click="moveBlock(block.id, 'down')" :disabled="idx === blocks.length - 1"
+                              title="Move down"
+                              class="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 disabled:opacity-25 disabled:cursor-not-allowed">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                      </button>
+                      <button @click="removeBlock(block.id)"
+                              title="Remove block"
+                              class="p-1 rounded text-red-300 hover:text-red-600 hover:bg-red-50">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                  <textarea x-model="block.content" @input="builderDirty = true" rows="4"
+                            placeholder="Block content. Use {{field_name}} tokens for placeholder values."
+                            class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono bg-slate-50 focus:bg-white focus:ring-2 focus:ring-compass-500 outline-none resize-y text-slate-700 leading-relaxed"></textarea>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live preview (toggleable) -->
+      <div class="mt-5">
+        <button @click="builderPreviewOpen = !builderPreviewOpen"
+                class="flex items-center gap-2 text-sm font-medium text-compass-700 hover:text-compass-800 mb-3">
+          <svg class="w-4 h-4 transition-transform" :class="builderPreviewOpen ? 'rotate-90' : ''"
+               fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+          </svg>
+          <span x-text="builderPreviewOpen ? 'Hide Preview' : 'Show Live Preview'"></span>
+        </button>
+        <div x-show="builderPreviewOpen" x-cloak class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <div class="px-5 py-3 bg-slate-50 border-b border-slate-100 flex items-center gap-3 text-xs text-slate-500">
+            <span class="font-medium text-slate-600">Preview</span>
+            <span x-text="pageSetup.paper_size + ' · ' + pageSetup.orientation"></span>
+            <span>Margins: <span x-text="pageSetup.margin_top + '/' + pageSetup.margin_right + '/' + pageSetup.margin_bottom + '/' + pageSetup.margin_left + ' mm'"></span></span>
+            <span class="ml-auto">Tokens highlighted in <mark class="bg-yellow-100 px-0.5 rounded">yellow</mark></span>
+          </div>
+          <div class="p-6 bg-slate-100 overflow-auto">
+            <div class="mx-auto bg-white shadow-md"
+                 :style="`max-width: ${pageSetup.orientation === 'landscape' ? '297mm' : '210mm'}; font-family: Georgia, serif; font-size: 11pt; line-height: 1.7; padding: ${pageSetup.margin_top}mm ${pageSetup.margin_right}mm ${pageSetup.margin_bottom}mm ${pageSetup.margin_left}mm;`">
+              <template x-for="(block, idx) in blocks" :key="block.id + '-p'">
+                <div :class="{
+                       'mb-4': true,
+                       'text-center': block.align === 'center',
+                       'text-right':  block.align === 'right',
+                       'font-bold text-lg border-b-2 border-slate-800 pb-2 mb-3': block.type === 'letterhead',
+                       'font-semibold underline': block.type === 'subject_line',
+                       'mt-6 pt-3 border-t border-slate-400': block.type === 'signature_block',
+                       'text-xs text-slate-500 border-t border-slate-200 pt-1': block.type === 'footer'
+                     }"
+                     x-html="block.content
+                       .replace(/\n/g, '<br>')
+                       .replace(/\{\{(\w+)\}\}/g, '<mark style=\'background:#fef9c3;padding:0 2px;border-radius:2px;\'>{{$1}}</mark>')">
+                </div>
+              </template>
+              <div x-show="blocks.length === 0" class="text-center text-slate-300 py-10 text-sm italic">
+                Add blocks to see a preview of the document layout.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
-</div>
+  {% endif %}
 
-<!-- Add Stage modal -->
-<div x-show="stageModal" x-cloak x-transition
-     style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
-  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
-    <h3 class="font-semibold text-slate-800 mb-5">Add Workflow Stage</h3>
-    <template x-if="stageError">
-      <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="stageError"></div>
-    </template>
-    <div class="space-y-4">
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Stage Order</label>
-          <input type="number" x-model="stageForm.stage_order" min="1"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+  <!-- ========== MODALS (inside x-data scope) ========== -->
+
+  <!-- Add Placeholder modal -->
+  <div x-show="phModal" x-cloak x-transition
+       style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
+    <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
+      <h3 class="font-semibold text-slate-800 mb-5">Add Field</h3>
+      <template x-if="phError">
+        <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="phError"></div>
+      </template>
+      <div class="space-y-4">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Name <span class="text-red-400">*</span></label>
+            <input type="text" x-model="phForm.name" placeholder="recipient"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none font-mono" />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Label <span class="text-red-400">*</span></label>
+            <input type="text" x-model="phForm.label" placeholder="Recipient"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
         </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Title <span class="text-red-400">*</span></label>
-          <input type="text" x-model="stageForm.title" placeholder="Initial Review"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Field Type</label>
+            <select x-model="phForm.field_type"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+              {% for ft in field_type_choices %}
+                <option value="{{ ft }}">{{ ft }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Display Order</label>
+            <input type="number" x-model="phForm.display_order" min="1"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
         </div>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Mode</label>
-          <select x-model="stageForm.mode"
-                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
-            <option value="SEQUENTIAL">SEQUENTIAL</option>
-            <option value="PARALLEL_ALL">PARALLEL_ALL</option>
-            <option value="PARALLEL_ANY">PARALLEL_ANY</option>
-          </select>
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Required Action</label>
-          <select x-model="stageForm.required_action"
-                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
-            {% for act in action_choices %}
-              <option value="{{ act }}">{{ act }}</option>
-            {% endfor %}
-          </select>
-        </div>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Actor Type</label>
-          <select x-model="stageForm.actor_type"
-                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
-            <option value="USER">USER</option>
-            <option value="ROLE">ROLE</option>
-            <option value="POSITION">POSITION</option>
-            <option value="DYNAMIC">DYNAMIC</option>
-          </select>
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-1">Actor Value</label>
-          <input type="text" x-model="stageForm.actor_value" placeholder="reviewer"
-                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        <div class="flex items-center gap-2">
+          <input type="checkbox" id="ph-required" x-model="phForm.is_required"
+                 class="w-4 h-4 accent-compass-600 rounded" />
+          <label for="ph-required" class="text-sm text-slate-700">Required field</label>
         </div>
       </div>
-      <div>
-        <label class="block text-xs font-medium text-slate-600 mb-1">SLA Hours</label>
-        <input type="number" x-model="stageForm.sla_hours" min="1"
-               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+      <div class="flex gap-3 justify-end mt-6">
+        <button @click="phModal = false; phError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+        <button @click="savePlaceholder()" :disabled="phSubmitting"
+                class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
+          <span x-text="phSubmitting ? 'Adding…' : 'Add Field'"></span>
+        </button>
       </div>
-      <div class="flex items-center gap-2">
-        <input type="checkbox" id="stage-mandatory" x-model="stageForm.is_mandatory"
-               class="w-4 h-4 accent-compass-600 rounded" />
-        <label for="stage-mandatory" class="text-sm text-slate-700">Mandatory stage</label>
-      </div>
-    </div>
-    <div class="flex gap-3 justify-end mt-6">
-      <button @click="stageModal = false; stageError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
-      <button @click="saveStage()" :disabled="stageSubmitting"
-              class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
-        <span x-text="stageSubmitting ? 'Adding…' : 'Add Stage'"></span>
-      </button>
     </div>
   </div>
+
+  <!-- Add Stage modal -->
+  <div x-show="stageModal" x-cloak x-transition
+       style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem;">
+    <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-6" @click.stop>
+      <h3 class="font-semibold text-slate-800 mb-5">Add Workflow Stage</h3>
+      <template x-if="stageError">
+        <div class="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4" x-text="stageError"></div>
+      </template>
+      <div class="space-y-4">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Stage Order</label>
+            <input type="number" x-model="stageForm.stage_order" min="1"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Title <span class="text-red-400">*</span></label>
+            <input type="text" x-model="stageForm.title" placeholder="Initial Review"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Mode</label>
+            <select x-model="stageForm.mode"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+              <option value="SEQUENTIAL">SEQUENTIAL</option>
+              <option value="PARALLEL_ALL">PARALLEL_ALL</option>
+              <option value="PARALLEL_ANY">PARALLEL_ANY</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Required Action</label>
+            <select x-model="stageForm.required_action"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+              {% for act in action_choices %}
+                <option value="{{ act }}">{{ act }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Actor Type</label>
+            <select x-model="stageForm.actor_type"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+              <option value="USER">USER</option>
+              <option value="ROLE">ROLE</option>
+              <option value="POSITION">POSITION</option>
+              <option value="DYNAMIC">DYNAMIC</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Actor Value</label>
+            <input type="text" x-model="stageForm.actor_value" placeholder="reviewer"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">SLA Hours</label>
+          <input type="number" x-model="stageForm.sla_hours" min="1"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+        <div class="flex items-center gap-2">
+          <input type="checkbox" id="stage-mandatory" x-model="stageForm.is_mandatory"
+                 class="w-4 h-4 accent-compass-600 rounded" />
+          <label for="stage-mandatory" class="text-sm text-slate-700">Mandatory stage</label>
+        </div>
+      </div>
+      <div class="flex gap-3 justify-end mt-6">
+        <button @click="stageModal = false; stageError = ''" class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+        <button @click="saveStage()" :disabled="stageSubmitting"
+                class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg">
+          <span x-text="stageSubmitting ? 'Adding…' : 'Add Stage'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 {% endblock %}
