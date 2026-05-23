@@ -50,6 +50,29 @@ current_office = current_exp.office if current_exp else None
 
 ## Development Setup (COMPASS root)
 
+### Python Environment (virtualenvwrapper)
+
+- Environment manager: `virtualenvwrapper-win`
+- Project environment name: `envSuper`
+- Environment location: `C:\Users\Sahibzada\Envs\envSuper`
+- Python executable to use for all project commands:
+    - `C:\Users\Sahibzada\Envs\envSuper\Scripts\python.exe`
+
+Recommended command patterns:
+
+```powershell
+# Option 1: activate by name
+workon envSuper
+
+# Option 2: run directly with env python (no activation needed)
+C:\Users\Sahibzada\Envs\envSuper\Scripts\python.exe manage.py runserver
+```
+
+Rule for AI coding assistants in this project:
+
+- Always run Django/manage.py commands with `envSuper`.
+- If shell activation is uncertain, use the full python path from `envSuper` directly.
+
 ```bash
 # Dev (no Celery)
 python manage.py runserver
