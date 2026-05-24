@@ -16,7 +16,7 @@
 {% block content %}
 
 <div x-data="{
-  activeTab: 'placeholders',
+  activeTab: '{{ initial_tab|default:"placeholders"|escapejs }}',
   csrfToken() { return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || ''; },
 
   /* Placeholders */

@@ -397,12 +397,19 @@ def document_detail_ui(request, document_id: int):
     # Available workflow actions based on status
     status = document.status
     available_actions = []
-    if status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL):
+    has_active_workflow_stage = any(
+        stage.status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL)
+        for stage in workflow_stages
+    )
+    workflow_warning = ""
+    if status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL) and has_active_workflow_stage:
         available_actions = [
             a.value for a in WorkflowActionType
             if a.value not in ("REJECT",)  # reject shown separately
         ]
         available_actions.append("reject")
+    elif status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL):
+        workflow_warning = "This document is in a review state but has no active workflow stages. Configure template workflow stages and resubmit the document."
 
     # Determine which tabs to show
     tabs = [
@@ -436,6 +443,7 @@ def document_detail_ui(request, document_id: int):
         "attachments_json": attachments_json,
         "pdf_list": pdf_list,
         "available_actions": available_actions,
+        "workflow_warning": workflow_warning,
         "tabs": tabs,
     })
 
@@ -857,6 +865,9 @@ def template_detail(request, template_id: int):
         (r for r in revisions if r.is_published),
         revisions[0] if revisions else None,
     )
+    initial_tab = request.GET.get("tab", "placeholders")
+    if initial_tab not in {"placeholders", "workflow", "revisions", "builder"}:
+        initial_tab = "placeholders"
 
     if current_revision is None:
         return render(request, "docgen/template_detail.html", {
@@ -865,6 +876,7 @@ def template_detail(request, template_id: int):
             "placeholders": [],
             "stages": [],
             "revisions": revisions,
+            "initial_tab": initial_tab,
             "field_type_choices": [ft.value for ft in PlaceholderType],
             "action_choices": [a.value for a in WorkflowActionType],
             "optional_logo_options": _optional_logo_options(),
@@ -887,6 +899,7 @@ def template_detail(request, template_id: int):
         "placeholders": placeholders,
         "stages": stages,
         "revisions": revisions,
+        "initial_tab": initial_tab,
         "field_type_choices": [ft.value for ft in PlaceholderType],
         "action_choices": [a.value for a in WorkflowActionType],
         "optional_logo_options": _optional_logo_options(),

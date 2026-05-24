@@ -724,6 +724,15 @@ def document_submit(request, document_id: int):
 	if document.status not in [DocumentStatus.DRAFT, DocumentStatus.RETURNED]:
 		return JsonResponse({"error": "Only draft or returned documents can be submitted."}, status=400)
 
+	template_stages = list(document.template_revision.workflow_stages.order_by("stage_order", "id"))
+	if not template_stages:
+		return JsonResponse(
+			{
+				"error": "Cannot submit document because no workflow stages are configured on the template revision. Configure workflow stages first.",
+			},
+			status=400,
+		)
+
 	if not document.reference_number:
 		document.assign_reference_number()
 
@@ -737,7 +746,6 @@ def document_submit(request, document_id: int):
 	document.save(update_fields=["submitted_at", "metadata", "updated_at"])
 
 	document.workflow_stages.all().delete()
-	template_stages = list(document.template_revision.workflow_stages.order_by("stage_order", "id"))
 	first_stage_order = template_stages[0].stage_order if template_stages else None
 	for stage in template_stages:
 		stage_status = DocumentStatus.DRAFT

@@ -288,8 +288,12 @@
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
       body: '{}'
     });
-    if (resp.ok) { window.location.reload(); }
-    else { const d = await resp.json(); alert(d.error || 'Submit failed.'); }
+    if (resp.ok) {
+      window.location.reload();
+      return;
+    }
+    const d = await resp.json().catch(() => ({}));
+    alert(d.error || `Submit failed (${resp.status}).`);
   },
 
   async doWithdraw() {
@@ -349,10 +353,10 @@
         </button>
       {% endif %}
 
-      {% if document.status == 'DRAFT' %}
+      {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
         <button @click="submitModal = true"
                 class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg transition-colors">
-          Submit for Review
+          {% if document.status == 'RETURNED' %}Resubmit for Review{% else %}Submit for Review{% endif %}
         </button>
       {% endif %}
 
@@ -693,6 +697,15 @@
   <!-- TAB: Workflow -->
   <div x-show="activeTab === 'workflow'" x-cloak>
     <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      {% if workflow_warning %}
+        <div class="px-5 py-4 border-b border-amber-200 bg-amber-50 text-amber-800 text-sm flex items-center justify-between gap-3">
+          <span>{{ workflow_warning }}</span>
+          <a href="{% url 'docgen:ui-template-detail' document.template_revision.template_id %}?tab=workflow"
+             class="shrink-0 inline-flex items-center px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-medium">
+            Configure Workflow
+          </a>
+        </div>
+      {% endif %}
       {% if workflow_stages %}
         <div class="divide-y divide-slate-100">
           {% for stage in workflow_stages %}
@@ -741,7 +754,15 @@
           {% endfor %}
         </div>
       {% else %}
-        <p class="px-5 py-8 text-center text-slate-400 text-sm">No workflow stages yet. Submit the document to start the workflow.</p>
+        <div class="px-5 py-8 text-center">
+          <p class="text-slate-400 text-sm mb-3">No workflow stages yet. Configure template workflow first, then submit the document.</p>
+          {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
+            <a href="{% url 'docgen:ui-template-detail' document.template_revision.template_id %}?tab=workflow"
+               class="inline-flex items-center px-3 py-1.5 rounded-lg bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium">
+              Open Template Workflow Setup
+            </a>
+          {% endif %}
+        </div>
       {% endif %}
     </div>
   </div>
@@ -947,8 +968,6 @@
     </div>
   </div>
 
-</div>
-
 <!-- ========== MODALS ========== -->
 
 <!-- Submit confirmation -->
@@ -1028,6 +1047,8 @@
       <button @click="archiveModal = false; doArchive()" class="text-sm bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-lg">Archive</button>
     </div>
   </div>
+</div>
+
 </div>
 
 {% endblock %}
