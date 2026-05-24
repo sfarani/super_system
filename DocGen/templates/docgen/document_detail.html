@@ -60,6 +60,17 @@
   workflowStageModal: false,
   workflowStageSubmitting: false,
   workflowStageError: '',
+  workflowStageEditId: null,
+  workflowStageEditSubmitting: false,
+  workflowStageEditError: '',
+  workflowStageEditForm: {
+    stage_order: 1,
+    title: '',
+    execution_mode: 'SEQUENTIAL',
+    actor_type: 'USER',
+    actor_value: '',
+    required_action: 'REVIEW'
+  },
   workflowStageForm: {
     stage_order: 1,
     title: '',
@@ -373,6 +384,49 @@
     }
     const d = await resp.json().catch(() => ({}));
     alert(d.error || 'Failed to delete workflow stage.');
+  },
+
+  startWorkflowStageEdit(stage) {
+    this.workflowStageEditError = '';
+    this.workflowStageEditId = stage.id;
+    this.workflowStageEditForm = {
+      stage_order: parseInt(stage.stage_order) || 1,
+      title: stage.title || '',
+      execution_mode: stage.execution_mode || 'SEQUENTIAL',
+      actor_type: stage.actor_type || 'USER',
+      actor_value: stage.actor_value || '',
+      required_action: stage.required_action || 'REVIEW'
+    };
+  },
+
+  cancelWorkflowStageEdit() {
+    this.workflowStageEditId = null;
+    this.workflowStageEditError = '';
+  },
+
+  async saveWorkflowStageEdit() {
+    if (!this.workflowStageEditId) return;
+    this.workflowStageEditSubmitting = true;
+    this.workflowStageEditError = '';
+    const resp = await fetch('{% url "docgen:document-workflow-stage-detail" document.id 0 %}'.replace('/0/', '/' + this.workflowStageEditId + '/'), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({
+        stage_order: parseInt(this.workflowStageEditForm.stage_order) || 1,
+        title: this.workflowStageEditForm.title,
+        execution_mode: this.workflowStageEditForm.execution_mode,
+        actor_type: this.workflowStageEditForm.actor_type,
+        actor_value: this.workflowStageEditForm.actor_value,
+        required_action: this.workflowStageEditForm.required_action,
+      })
+    });
+    this.workflowStageEditSubmitting = false;
+    if (resp.ok) {
+      window.location.reload();
+      return;
+    }
+    const d = await resp.json().catch(() => ({}));
+    this.workflowStageEditError = d.error || 'Failed to update workflow stage.';
   }
 }">
 
@@ -777,42 +831,106 @@
               {{ stage.stage_order }}
             </div>
             <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-2 flex-wrap">
-                <p class="font-medium text-slate-800">{{ stage.title }}</p>
-                <span class="text-xs px-2 py-0.5 rounded font-medium
-                             {% if stage.status == 'COMPLETED' or stage.status == 'APPROVED' %}bg-green-100 text-green-700
-                             {% elif stage.status == 'UNDER_REVIEW' or stage.status == 'UNDER_APPROVAL' %}bg-amber-100 text-amber-700
-                             {% elif stage.status == 'REJECTED' %}bg-red-100 text-red-700
-                             {% else %}bg-slate-100 text-slate-500{% endif %}">
-                  {{ stage.status }}
-                </span>
-                <span class="text-xs text-slate-400">{{ stage.execution_mode }}</span>
-              </div>
-              <p class="text-xs text-slate-500 mt-0.5">
-                Actor: <span class="font-medium text-slate-700">{{ stage.actor_value|default:"—" }}</span>
-                &bull; Action: {{ stage.required_action }}
-              </p>
-              {% if stage.acted_by %}
-                <p class="text-xs text-slate-500 mt-0.5">
-                  Actioned by <strong>{{ stage.acted_by }}</strong>
-                  {% if stage.acted_at %}on {{ stage.acted_at|date:"d M Y H:i" }}{% endif %}
-                </p>
-              {% endif %}
-              {% if stage.comments %}
-                <p class="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded px-2 py-1 mt-2 italic">{{ stage.comments }}</p>
-              {% endif %}
-              {% if stage.due_at %}
-                <p class="text-xs text-slate-400 mt-1">
-                  Due: {{ stage.due_at|date:"d M Y H:i" }}
-                  {% if stage.escalated_at %}<span class="text-red-500 font-medium ml-2">Escalated</span>{% endif %}
-                </p>
-              {% endif %}
-              {% if can_configure_document_workflow %}
-                <div class="mt-2">
-                  <button @click="deleteWorkflowStage({{ stage.id }})"
-                          class="text-xs text-red-500 hover:text-red-700">Delete Stage</button>
+              <div x-show="workflowStageEditId !== {{ stage.id }}">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <p class="font-medium text-slate-800">{{ stage.title }}</p>
+                  <span class="text-xs px-2 py-0.5 rounded font-medium
+                               {% if stage.status == 'COMPLETED' or stage.status == 'APPROVED' %}bg-green-100 text-green-700
+                               {% elif stage.status == 'UNDER_REVIEW' or stage.status == 'UNDER_APPROVAL' %}bg-amber-100 text-amber-700
+                               {% elif stage.status == 'REJECTED' %}bg-red-100 text-red-700
+                               {% else %}bg-slate-100 text-slate-500{% endif %}">
+                    {{ stage.status }}
+                  </span>
+                  <span class="text-xs text-slate-400">{{ stage.execution_mode }}</span>
                 </div>
-              {% endif %}
+                <p class="text-xs text-slate-500 mt-0.5">
+                  Actor: <span class="font-medium text-slate-700">{{ stage.actor_value|default:"—" }}</span>
+                  &bull; Action: {{ stage.required_action }}
+                </p>
+                {% if stage.acted_by %}
+                  <p class="text-xs text-slate-500 mt-0.5">
+                    Actioned by <strong>{{ stage.acted_by }}</strong>
+                    {% if stage.acted_at %}on {{ stage.acted_at|date:"d M Y H:i" }}{% endif %}
+                  </p>
+                {% endif %}
+                {% if stage.comments %}
+                  <p class="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded px-2 py-1 mt-2 italic">{{ stage.comments }}</p>
+                {% endif %}
+                {% if stage.due_at %}
+                  <p class="text-xs text-slate-400 mt-1">
+                    Due: {{ stage.due_at|date:"d M Y H:i" }}
+                    {% if stage.escalated_at %}<span class="text-red-500 font-medium ml-2">Escalated</span>{% endif %}
+                  </p>
+                {% endif %}
+                {% if can_configure_document_workflow %}
+                  <div class="mt-2 flex items-center gap-3">
+                    <button @click="startWorkflowStageEdit({ id: {{ stage.id }}, stage_order: {{ stage.stage_order }}, title: '{{ stage.title|escapejs }}', execution_mode: '{{ stage.execution_mode|escapejs }}', actor_type: '{{ stage.actor_type|escapejs }}', actor_value: '{{ stage.actor_value|default:''|escapejs }}', required_action: '{{ stage.required_action|escapejs }}' })"
+                            class="text-xs text-compass-600 hover:text-compass-700">Edit Stage</button>
+                    <button @click="deleteWorkflowStage({{ stage.id }})"
+                            class="text-xs text-red-500 hover:text-red-700">Delete Stage</button>
+                  </div>
+                {% endif %}
+              </div>
+
+              <div x-show="workflowStageEditId === {{ stage.id }}" x-cloak class="border border-compass-200 bg-compass-50/40 rounded-lg p-3 space-y-2">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <div>
+                    <label class="block text-[11px] font-medium text-slate-500 mb-1">Stage Order</label>
+                    <input type="number" min="1" x-model="workflowStageEditForm.stage_order"
+                           class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500" />
+                  </div>
+                  <div>
+                    <label class="block text-[11px] font-medium text-slate-500 mb-1">Execution Mode</label>
+                    <select x-model="workflowStageEditForm.execution_mode"
+                            class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500 bg-white">
+                      {% for mode in workflow_mode_choices %}
+                        <option value="{{ mode }}">{{ mode }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-500 mb-1">Title</label>
+                  <input type="text" x-model="workflowStageEditForm.title"
+                         class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500" />
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <div>
+                    <label class="block text-[11px] font-medium text-slate-500 mb-1">Actor Type</label>
+                    <select x-model="workflowStageEditForm.actor_type"
+                            class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500 bg-white">
+                      {% for actor_type in workflow_actor_type_choices %}
+                        <option value="{{ actor_type }}">{{ actor_type }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block text-[11px] font-medium text-slate-500 mb-1">Required Action</label>
+                    <select x-model="workflowStageEditForm.required_action"
+                            class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500 bg-white">
+                      {% for action in workflow_action_choices %}
+                        <option value="{{ action }}">{{ action }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-500 mb-1">Actor Value</label>
+                  <input type="text" x-model="workflowStageEditForm.actor_value"
+                         class="w-full border border-slate-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-compass-500" />
+                </div>
+                <template x-if="workflowStageEditError">
+                  <p class="text-xs text-red-600" x-text="workflowStageEditError"></p>
+                </template>
+                <div class="flex items-center gap-2">
+                  <button @click="saveWorkflowStageEdit()" :disabled="workflowStageEditSubmitting"
+                          class="text-xs bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-3 py-1.5 rounded">
+                    <span x-text="workflowStageEditSubmitting ? 'Saving…' : 'Save Changes'"></span>
+                  </button>
+                  <button @click="cancelWorkflowStageEdit()"
+                          class="text-xs border border-slate-300 text-slate-600 px-3 py-1.5 rounded hover:bg-slate-50">Cancel</button>
+                </div>
+              </div>
             </div>
           </div>
           {% endfor %}
