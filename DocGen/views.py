@@ -9,6 +9,7 @@ from django.core import signing
 from django.core.signing import BadSignature
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
+from django.db.utils import OperationalError, ProgrammingError
 from django.db.models import Q
 from django.http import JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -32,6 +33,7 @@ from .models import (
 	TemplateCategory,
 	TemplatePlaceholder,
 	TemplateRevision,
+	TemplateTokenDefinition,
 	TemplateStatus,
 	TemplateWorkflowStage,
 )
@@ -571,6 +573,33 @@ def document_set_fields(request, document_id: int):
 
 	updated_token_count = None
 	if template_tokens_payload is not None:
+		requested_keys = [str(k).strip() for k in template_tokens_payload.keys() if str(k).strip()]
+		try:
+			definitions = {
+				row["key"]: row
+				for row in TemplateTokenDefinition.objects.filter(is_active=True, key__in=requested_keys).values("key", "allow_document_override")
+			}
+			missing_keys = sorted(set(requested_keys) - set(definitions.keys()))
+			if missing_keys:
+				return JsonResponse(
+					{"error": f"Unknown template token keys: {', '.join(missing_keys)}"},
+					status=400,
+				)
+
+			non_overridable = sorted(
+				key
+				for key in requested_keys
+				if key in definitions and not definitions[key]["allow_document_override"]
+			)
+			if non_overridable:
+				return JsonResponse(
+					{"error": f"Token keys not allowed for document override: {', '.join(non_overridable)}"},
+					status=400,
+				)
+		except (ProgrammingError, OperationalError):
+			# Registry tables may not exist before migrations are applied.
+			pass
+
 		normalized_tokens = {}
 		for key, value in template_tokens_payload.items():
 			if not isinstance(key, str):

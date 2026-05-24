@@ -6,13 +6,19 @@ Base prefix:   /compass/docgen/ui/
 """
 from __future__ import annotations
 
+import csv
 import json
+from io import StringIO
 
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db.models import Count, Q, Prefetch
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 
+from .services import resolve_registry_template_tokens
 from .models import (
     Document,
     DocumentAttachment,
@@ -25,9 +31,14 @@ from .models import (
     Template,
     TemplateCategory,
     TemplateRevision,
+    TemplateTokenAuditAction,
+    TemplateTokenAuditLog,
+    TemplateTokenDefinition,
+    TemplateTokenValue,
     TemplatePlaceholder,
     TemplateStatus,
     TemplateWorkflowStage,
+    TokenScope,
     WorkflowActionType,
 )
 
@@ -228,6 +239,9 @@ def document_detail_ui(request, document_id: int):
     metadata = document.metadata if isinstance(document.metadata, dict) else {}
     template_tokens_map = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
     template_tokens_json = json.dumps(template_tokens_map)
+    inherited_tokens_map, inherited_sources_map = resolve_registry_template_tokens(document)
+    inherited_tokens_json = json.dumps(inherited_tokens_map)
+    inherited_token_sources_json = json.dumps(inherited_sources_map)
 
     # Workflow stages
     workflow_stages = list(
@@ -317,6 +331,8 @@ def document_detail_ui(request, document_id: int):
         "placeholders": placeholders,
         "fields_json": fields_json,
         "template_tokens_json": template_tokens_json,
+        "inherited_tokens_json": inherited_tokens_json,
+        "inherited_token_sources_json": inherited_token_sources_json,
         "workflow_stages": wf_data,
         "timeline_events": timeline_events,
         "comments_json": comments_json,
@@ -358,6 +374,371 @@ def template_list(request):
         "templates": templates_data,
         "categories": categories,
     })
+
+
+# ---------------------------------------------------------------------------
+# Central Token Registry (global/department/user values)
+# ---------------------------------------------------------------------------
+
+@login_required
+def token_registry(request):
+    can_manage_group_tokens = (
+        request.user.is_superuser
+        or request.user.is_staff
+        or request.user.has_perm(f"{Template._meta.app_label}.admin")
+    )
+    groups = list(request.user.groups.order_by("name"))
+
+    selected_group = None
+    selected_group_id = request.GET.get("group_id") or request.POST.get("group_id")
+    if can_manage_group_tokens and groups:
+        if selected_group_id:
+            try:
+                selected_group = next(g for g in groups if g.id == int(selected_group_id))
+            except (StopIteration, ValueError, TypeError):
+                selected_group = groups[0]
+        else:
+            selected_group = groups[0]
+
+    definitions = list(TemplateTokenDefinition.objects.filter(is_active=True).order_by("key"))
+    def_ids = [d.id for d in definitions]
+    definitions_by_key = {d.key: d for d in definitions}
+
+    def _apply_token_value(*, definition, scope, value, actor, source, group=None, user=None):
+        lookup = {
+            "definition": definition,
+            "scope": scope,
+        }
+        if scope == TokenScope.GROUP:
+            lookup["group"] = group
+        if scope == TokenScope.USER:
+            lookup["user"] = user
+
+        existing = TemplateTokenValue.objects.filter(**lookup).first()
+        normalized = (value or "").strip()
+        old_value = existing.value if existing else ""
+
+        if not normalized:
+            if existing is not None:
+                existing.delete()
+                TemplateTokenAuditLog.objects.create(
+                    definition=definition,
+                    scope=scope,
+                    group=group if scope == TokenScope.GROUP else None,
+                    user=user if scope == TokenScope.USER else None,
+                    actor=actor,
+                    action=TemplateTokenAuditAction.DELETE,
+                    old_value=old_value,
+                    new_value="",
+                    source=source,
+                )
+            return
+
+        if existing is None:
+            TemplateTokenValue.objects.create(value=normalized, **lookup)
+            TemplateTokenAuditLog.objects.create(
+                definition=definition,
+                scope=scope,
+                group=group if scope == TokenScope.GROUP else None,
+                user=user if scope == TokenScope.USER else None,
+                actor=actor,
+                action=TemplateTokenAuditAction.CREATE,
+                old_value="",
+                new_value=normalized,
+                source=source,
+            )
+            return
+
+        if old_value != normalized:
+            existing.value = normalized
+            existing.save(update_fields=["value", "updated_at"])
+            TemplateTokenAuditLog.objects.create(
+                definition=definition,
+                scope=scope,
+                group=group if scope == TokenScope.GROUP else None,
+                user=user if scope == TokenScope.USER else None,
+                actor=actor,
+                action=TemplateTokenAuditAction.UPDATE,
+                old_value=old_value,
+                new_value=normalized,
+                source=source,
+            )
+
+    if request.method == "GET" and request.GET.get("export") == "csv":
+        rows = []
+        global_values = TemplateTokenValue.objects.filter(definition_id__in=def_ids, scope=TokenScope.GLOBAL)
+        for row in global_values.select_related("definition"):
+            rows.append({
+                "key": row.definition.key,
+                "scope": "GLOBAL",
+                "target": "",
+                "value": row.value,
+            })
+
+        if selected_group is not None:
+            group_values = TemplateTokenValue.objects.filter(
+                definition_id__in=def_ids,
+                scope=TokenScope.GROUP,
+                group=selected_group,
+            )
+            for row in group_values.select_related("definition", "group"):
+                rows.append({
+                    "key": row.definition.key,
+                    "scope": "GROUP",
+                    "target": row.group.name if row.group else "",
+                    "value": row.value,
+                })
+
+        user_values = TemplateTokenValue.objects.filter(
+            definition_id__in=def_ids,
+            scope=TokenScope.USER,
+            user=request.user,
+        )
+        for row in user_values.select_related("definition", "user"):
+            rows.append({
+                "key": row.definition.key,
+                "scope": "USER",
+                "target": row.user.username if row.user else "",
+                "value": row.value,
+            })
+
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=["key", "scope", "target", "value"])
+        writer.writeheader()
+        writer.writerows(rows)
+        response = HttpResponse(output.getvalue(), content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="docgen_token_registry.csv"'
+        return response
+
+    if request.method == "POST":
+        action = request.POST.get("action", "save")
+
+        if action == "import_csv":
+            upload = request.FILES.get("csv_file")
+            if upload is None:
+                messages.error(request, "Please choose a CSV file to import.")
+                return redirect(reverse("docgen:ui-token-registry"))
+
+            try:
+                decoded = upload.read().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                messages.error(request, "CSV must be UTF-8 encoded.")
+                return redirect(reverse("docgen:ui-token-registry"))
+
+            reader = csv.DictReader(StringIO(decoded))
+            required_cols = {"key", "scope", "target", "value"}
+            if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
+                messages.error(request, "CSV headers must include: key,scope,target,value")
+                return redirect(reverse("docgen:ui-token-registry"))
+
+            applied = 0
+            errors: list[str] = []
+            for idx, row in enumerate(reader, start=2):
+                key = (row.get("key") or "").strip()
+                raw_scope = (row.get("scope") or "").strip().upper()
+                target = (row.get("target") or "").strip()
+                value = (row.get("value") or "").strip()
+                scope = "GROUP" if raw_scope == "DEPARTMENT" else raw_scope
+
+                if not key or scope not in {"GLOBAL", "GROUP", "USER"}:
+                    errors.append(f"Row {idx}: invalid key/scope.")
+                    continue
+                definition = definitions_by_key.get(key)
+                if definition is None:
+                    errors.append(f"Row {idx}: unknown token key '{key}'.")
+                    continue
+
+                if scope == "GLOBAL":
+                    if not can_manage_group_tokens:
+                        errors.append(f"Row {idx}: not allowed to import GLOBAL values.")
+                        continue
+                    _apply_token_value(
+                        definition=definition,
+                        scope=TokenScope.GLOBAL,
+                        value=value,
+                        actor=request.user,
+                        source="ui_csv_import",
+                    )
+                    applied += 1
+                    continue
+
+                if scope == "GROUP":
+                    if not can_manage_group_tokens or selected_group is None:
+                        errors.append(f"Row {idx}: no department scope selected.")
+                        continue
+                    if target and selected_group and target != selected_group.name:
+                        errors.append(f"Row {idx}: target '{target}' does not match selected department '{selected_group.name}'.")
+                        continue
+                    _apply_token_value(
+                        definition=definition,
+                        scope=TokenScope.GROUP,
+                        group=selected_group,
+                        value=value,
+                        actor=request.user,
+                        source="ui_csv_import",
+                    )
+                    applied += 1
+                    continue
+
+                if scope == "USER":
+                    if target and target != request.user.username:
+                        errors.append(f"Row {idx}: USER target must be '{request.user.username}' or blank.")
+                        continue
+                    _apply_token_value(
+                        definition=definition,
+                        scope=TokenScope.USER,
+                        user=request.user,
+                        value=value,
+                        actor=request.user,
+                        source="ui_csv_import",
+                    )
+                    applied += 1
+
+            if applied:
+                messages.success(request, f"Imported {applied} token rows.")
+            if errors:
+                messages.error(request, "Import issues: " + " ".join(errors[:5]))
+            query = ""
+            if selected_group is not None:
+                query = f"?group_id={selected_group.id}"
+            return redirect(reverse("docgen:ui-token-registry") + query)
+
+        # Save user-scoped token values.
+        for definition in definitions:
+            field_name = f"user_{definition.id}"
+            value = (request.POST.get(field_name) or "").strip()
+            _apply_token_value(
+                definition=definition,
+                scope=TokenScope.USER,
+                user=request.user,
+                value=value,
+                actor=request.user,
+                source="ui_form",
+            )
+
+        # Save selected group-scoped token values (if allowed).
+        if can_manage_group_tokens and selected_group is not None:
+            for definition in definitions:
+                field_name = f"group_{definition.id}"
+                value = (request.POST.get(field_name) or "").strip()
+                _apply_token_value(
+                    definition=definition,
+                    scope=TokenScope.GROUP,
+                    group=selected_group,
+                    value=value,
+                    actor=request.user,
+                    source="ui_form",
+                )
+
+        messages.success(request, "Token values saved successfully.")
+
+        redirect_url = reverse("docgen:ui-token-registry")
+        if selected_group is not None:
+            return redirect(f"{redirect_url}?saved=1&group_id={selected_group.id}")
+        return redirect(f"{redirect_url}?saved=1")
+
+    global_values = {
+        row["definition_id"]: row["value"]
+        for row in TemplateTokenValue.objects.filter(
+            definition_id__in=def_ids,
+            scope=TokenScope.GLOBAL,
+        ).values("definition_id", "value")
+    }
+    user_values = {
+        row["definition_id"]: row["value"]
+        for row in TemplateTokenValue.objects.filter(
+            definition_id__in=def_ids,
+            scope=TokenScope.USER,
+            user=request.user,
+        ).values("definition_id", "value")
+    }
+    group_values = {}
+    if selected_group is not None:
+        group_values = {
+            row["definition_id"]: row["value"]
+            for row in TemplateTokenValue.objects.filter(
+                definition_id__in=def_ids,
+                scope=TokenScope.GROUP,
+                group=selected_group,
+            ).values("definition_id", "value")
+        }
+
+    token_rows = [
+        {
+            "id": definition.id,
+            "key": definition.key,
+            "label": definition.label,
+            "description": definition.description,
+            "global_value": global_values.get(definition.id, ""),
+            "group_value": group_values.get(definition.id, ""),
+            "user_value": user_values.get(definition.id, ""),
+        }
+        for definition in definitions
+    ]
+
+    recent_audit_logs = list(
+        TemplateTokenAuditLog.objects.select_related("definition", "group", "user", "actor")[:30]
+    )
+
+    return render(request, "docgen/token_registry.html", {
+        "token_rows": token_rows,
+        "groups": groups,
+        "selected_group": selected_group,
+        "can_manage_group_tokens": can_manage_group_tokens,
+        "saved": request.GET.get("saved") == "1",
+        "recent_audit_logs": recent_audit_logs,
+    })
+
+
+@login_required
+def token_registry_sample_csv(request):
+    """Download a prefilled CSV template for token registry import."""
+    groups = list(request.user.groups.order_by("name"))
+    selected_group_id = request.GET.get("group_id")
+    selected_group = None
+    if groups:
+        if selected_group_id:
+            try:
+                selected_group = next(g for g in groups if g.id == int(selected_group_id))
+            except (StopIteration, ValueError, TypeError):
+                selected_group = groups[0]
+        else:
+            selected_group = groups[0]
+
+    definitions = list(TemplateTokenDefinition.objects.filter(is_active=True).order_by("key"))
+
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=["key", "scope", "target", "value"])
+    writer.writeheader()
+
+    # Prefill rows to reduce mistakes. Keep value empty so user fills it in.
+    for definition in definitions:
+        writer.writerow({
+            "key": definition.key,
+            "scope": "USER",
+            "target": request.user.username,
+            "value": "",
+        })
+        if selected_group is not None:
+            writer.writerow({
+                "key": definition.key,
+                "scope": "GROUP",
+                "target": selected_group.name,
+                "value": "",
+            })
+
+    # If no token definitions exist yet, include one instructional row.
+    if not definitions:
+        writer.writerow({
+            "key": "department",
+            "scope": "GROUP",
+            "target": selected_group.name if selected_group is not None else "Your Department",
+            "value": "",
+        })
+
+    response = HttpResponse(output.getvalue(), content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="docgen_token_registry_sample.csv"'
+    return response
 
 
 # ---------------------------------------------------------------------------

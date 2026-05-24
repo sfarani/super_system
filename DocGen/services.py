@@ -10,6 +10,7 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.utils import OperationalError, ProgrammingError
 from django.utils import timezone
 from django.utils.html import escape
 from django.utils.module_loading import import_string
@@ -17,7 +18,15 @@ from datetime import timedelta
 from xhtml2pdf import pisa
 
 from .adapters import LocalActorResolutionAdapter
-from .models import Document, DocumentPDF, DocumentStatus, DocumentWorkflowStage
+from .models import (
+    Document,
+    DocumentPDF,
+    DocumentStatus,
+    DocumentWorkflowStage,
+    TemplateTokenDefinition,
+    TemplateTokenValue,
+    TokenScope,
+)
 from .notifications import LocalNotificationAdapter
 
 
@@ -33,12 +42,75 @@ def _coerce_text_value(value_text, value_json) -> str:
     return json.dumps(value_json, ensure_ascii=True)
 
 
+def resolve_registry_template_tokens(document: Document) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve centralized template tokens for a document originator.
+
+    Precedence: GLOBAL < GROUP < USER
+    Returns: (resolved_values, source_labels)
+    """
+    try:
+        definitions = list(
+            TemplateTokenDefinition.objects.filter(is_active=True).values("id", "key")
+        )
+    except (ProgrammingError, OperationalError):
+        return {}, {}
+    if not definitions:
+        return {}, {}
+
+    def_by_id = {row["id"]: row["key"] for row in definitions}
+    def_ids = list(def_by_id.keys())
+
+    resolved: dict[str, str] = {}
+    sources: dict[str, str] = {}
+
+    global_rows = (
+        TemplateTokenValue.objects
+        .filter(definition_id__in=def_ids, scope=TokenScope.GLOBAL)
+        .values("definition_id", "value")
+    )
+    for row in global_rows:
+        key = def_by_id.get(row["definition_id"])
+        if key:
+            resolved[key] = row["value"]
+            sources[key] = "Global"
+
+    originator = document.originator
+    if originator is not None:
+        group_ids = list(originator.groups.values_list("id", flat=True))
+        if group_ids:
+            group_rows = (
+                TemplateTokenValue.objects
+                .filter(definition_id__in=def_ids, scope=TokenScope.GROUP, group_id__in=group_ids)
+                .values("definition_id", "value", "group__name")
+                .order_by("group__name", "group_id", "-updated_at")
+            )
+            for row in group_rows:
+                key = def_by_id.get(row["definition_id"])
+                if key:
+                    resolved[key] = row["value"]
+                    sources[key] = f"Department: {row['group__name'] or 'Group'}"
+
+        user_rows = (
+            TemplateTokenValue.objects
+            .filter(definition_id__in=def_ids, scope=TokenScope.USER, user=originator)
+            .values("definition_id", "value")
+        )
+        for row in user_rows:
+            key = def_by_id.get(row["definition_id"])
+            if key:
+                resolved[key] = row["value"]
+                sources[key] = "User"
+
+    return resolved, sources
+
+
 def _build_render_context(document: Document, field_map: dict[str, str]) -> dict[str, str]:
     now_local = timezone.localtime(timezone.now())
     submitted_at = timezone.localtime(document.submitted_at).strftime("%d %b %Y") if document.submitted_at else ""
     approved_at = timezone.localtime(document.approved_at).strftime("%d %b %Y") if document.approved_at else ""
     metadata = document.metadata if isinstance(document.metadata, dict) else {}
     custom_tokens = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
+    registry_tokens, _ = resolve_registry_template_tokens(document)
 
     context = {
         "reference_number": document.reference_number or "",
@@ -51,6 +123,7 @@ def _build_render_context(document: Document, field_map: dict[str, str]) -> dict
         "submitted_date": submitted_at,
         "approval_date": approved_at,
     }
+    context.update({str(k): "" if v is None else str(v) for k, v in registry_tokens.items() if str(k).strip()})
     context.update({str(k): "" if v is None else str(v) for k, v in custom_tokens.items() if str(k).strip()})
     context.update(field_map)
     return context

@@ -97,6 +97,138 @@ class TemplateCategory(TimeStampedModel):
 		return self.name
 
 
+class TokenScope(models.TextChoices):
+	GLOBAL = "GLOBAL", "Global"
+	GROUP = "GROUP", "Department (Group)"
+	USER = "USER", "User"
+
+
+class TemplateTokenDefinition(TimeStampedModel):
+	key = models.CharField(max_length=100, unique=True)
+	label = models.CharField(max_length=180)
+	description = models.TextField(blank=True)
+	is_active = models.BooleanField(default=True)
+	allow_document_override = models.BooleanField(default=True)
+
+	class Meta:
+		ordering = ["key"]
+
+	def __str__(self):
+		return self.key
+
+
+class TemplateTokenValue(TimeStampedModel):
+	definition = models.ForeignKey(
+		TemplateTokenDefinition,
+		on_delete=models.CASCADE,
+		related_name="values",
+	)
+	scope = models.CharField(max_length=16, choices=TokenScope.choices)
+	group = models.ForeignKey(
+		"auth.Group",
+		on_delete=models.CASCADE,
+		null=True,
+		blank=True,
+		related_name="docgen_template_token_values",
+	)
+	user = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.CASCADE,
+		null=True,
+		blank=True,
+		related_name="docgen_template_token_values",
+	)
+	value = models.TextField(blank=True)
+
+	class Meta:
+		ordering = ["definition__key", "scope", "group__name", "user__username"]
+		constraints = [
+			models.UniqueConstraint(
+				fields=["definition", "scope"],
+				condition=models.Q(scope=TokenScope.GLOBAL),
+				name="uniq_docgen_token_value_global",
+			),
+			models.UniqueConstraint(
+				fields=["definition", "scope", "group"],
+				condition=models.Q(scope=TokenScope.GROUP),
+				name="uniq_docgen_token_value_group",
+			),
+			models.UniqueConstraint(
+				fields=["definition", "scope", "user"],
+				condition=models.Q(scope=TokenScope.USER),
+				name="uniq_docgen_token_value_user",
+			),
+		]
+
+	def clean(self):
+		super().clean()
+		if self.scope == TokenScope.GLOBAL and (self.group_id or self.user_id):
+			raise ValidationError("Global token values cannot target group or user.")
+		if self.scope == TokenScope.GROUP and (not self.group_id or self.user_id):
+			raise ValidationError("Group token values require group and must not target user.")
+		if self.scope == TokenScope.USER and (not self.user_id or self.group_id):
+			raise ValidationError("User token values require user and must not target group.")
+
+	def __str__(self):
+		target = "global"
+		if self.scope == TokenScope.GROUP and self.group_id:
+			target = f"group:{self.group.name}"
+		elif self.scope == TokenScope.USER and self.user_id:
+			target = f"user:{self.user}"
+		return f"{self.definition.key} [{target}]"
+
+
+class TemplateTokenAuditAction(models.TextChoices):
+	CREATE = "CREATE", "Create"
+	UPDATE = "UPDATE", "Update"
+	DELETE = "DELETE", "Delete"
+
+
+class TemplateTokenAuditLog(TimeStampedModel):
+	definition = models.ForeignKey(
+		TemplateTokenDefinition,
+		on_delete=models.CASCADE,
+		related_name="audit_logs",
+	)
+	scope = models.CharField(max_length=16, choices=TokenScope.choices)
+	group = models.ForeignKey(
+		"auth.Group",
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="docgen_template_token_audit_logs",
+	)
+	user = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="docgen_template_token_audit_logs",
+	)
+	actor = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		null=True,
+		blank=True,
+		related_name="docgen_template_token_audit_actions",
+	)
+	action = models.CharField(max_length=16, choices=TemplateTokenAuditAction.choices)
+	old_value = models.TextField(blank=True)
+	new_value = models.TextField(blank=True)
+	source = models.CharField(max_length=40, default="ui")
+
+	class Meta:
+		ordering = ["-created_at", "-id"]
+
+	def __str__(self):
+		target = "global"
+		if self.scope == TokenScope.GROUP and self.group_id:
+			target = f"group:{self.group.name}"
+		elif self.scope == TokenScope.USER and self.user_id:
+			target = f"user:{self.user}"
+		return f"{self.definition.key} {self.action} [{target}]"
+
+
 class Template(TimeStampedModel):
 	category = models.ForeignKey(
 		TemplateCategory,

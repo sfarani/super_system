@@ -74,6 +74,8 @@ urlpatterns = [
     path("ui/documents/<int:document_id>/", ui_views.document_detail_ui, name="ui-document-detail"),
     path("ui/templates/", ui_views.template_list, name="ui-template-list"),
     path("ui/templates/<int:template_id>/", ui_views.template_detail, name="ui-template-detail"),
+    path("ui/tokens/", ui_views.token_registry, name="ui-token-registry"),
+    path("ui/tokens/sample-csv/", ui_views.token_registry_sample_csv, name="ui-token-registry-sample-csv"),
     # Public QR verification page (renders HTML for browser scans)
     path("ui/verify/<str:token>/", ui_views.verify_page, name="ui-verify-page"),
 ]

@@ -11,9 +11,12 @@ from .models import (
 	ReferenceNumberSequence,
 	RetentionPolicy,
 	Template,
+	TemplateTokenAuditLog,
 	TemplateCategory,
 	TemplatePlaceholder,
 	TemplateRevision,
+	TemplateTokenDefinition,
+	TemplateTokenValue,
 	TemplateWorkflowStage,
 )
 
@@ -49,6 +52,42 @@ class TemplatePlaceholderAdmin(admin.ModelAdmin):
 class TemplateWorkflowStageAdmin(admin.ModelAdmin):
 	list_display = ("revision", "stage_order", "title", "mode", "actor_type", "required_action")
 	list_filter = ("mode", "actor_type", "required_action")
+
+
+@admin.register(TemplateTokenDefinition)
+class TemplateTokenDefinitionAdmin(admin.ModelAdmin):
+	list_display = ("key", "label", "is_active", "allow_document_override", "updated_at")
+	list_filter = ("is_active", "allow_document_override")
+	search_fields = ("key", "label", "description")
+
+
+@admin.register(TemplateTokenValue)
+class TemplateTokenValueAdmin(admin.ModelAdmin):
+	list_display = ("definition", "scope", "group", "user", "updated_at")
+	list_filter = ("scope", "definition")
+	search_fields = ("definition__key", "group__name", "user__username", "value")
+	raw_id_fields = ("group", "user")
+
+
+@admin.register(TemplateTokenAuditLog)
+class TemplateTokenAuditLogAdmin(admin.ModelAdmin):
+	list_display = ("created_at", "definition", "scope", "group", "user", "action", "actor", "source")
+	list_filter = ("scope", "action", "source", "definition")
+	search_fields = ("definition__key", "group__name", "user__username", "actor__username", "old_value", "new_value")
+	raw_id_fields = ("definition", "group", "user", "actor")
+	readonly_fields = (
+		"created_at",
+		"updated_at",
+		"definition",
+		"scope",
+		"group",
+		"user",
+		"actor",
+		"action",
+		"old_value",
+		"new_value",
+		"source",
+	)
 
 
 @admin.register(Document)

@@ -1,0 +1,185 @@
+{% extends "docgen/base.html" %}
+
+{% block title %}Token Registry — DocGen{% endblock %}
+{% block page_title %}Token Registry{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-5">
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+    <h2 class="text-lg font-semibold text-slate-700">Centralized [] Token Values</h2>
+    <p class="text-sm text-slate-500 mt-1">
+      Manage user and department token values in one place. Effective precedence is:
+      <span class="font-medium text-slate-700">Global &lt; Department &lt; User &lt; Document Override</span>.
+    </p>
+    <p class="text-xs text-slate-500 mt-2">
+      CSV format: <span class="font-mono">key,scope,target,value</span> where scope is
+      <span class="font-mono">GLOBAL</span>, <span class="font-mono">GROUP</span> (or <span class="font-mono">DEPARTMENT</span>), or <span class="font-mono">USER</span>.
+    </p>
+    {% if saved %}
+      <div class="mt-3 bg-green-50 border border-green-200 text-green-700 text-sm rounded-lg px-3 py-2">
+        Token values saved successfully.
+      </div>
+    {% endif %}
+    <div class="mt-3 flex flex-wrap items-center gap-2">
+      <a href="?export=csv{% if selected_group %}&group_id={{ selected_group.id }}{% endif %}"
+         class="border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-1.5 rounded-lg">
+        Export CSV
+      </a>
+      <a href="{% url 'docgen:ui-token-registry-sample-csv' %}{% if selected_group %}?group_id={{ selected_group.id }}{% endif %}"
+         class="border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-1.5 rounded-lg">
+        Download Sample CSV
+      </a>
+      <form method="post" enctype="multipart/form-data" class="flex items-center gap-2">
+        {% csrf_token %}
+        {% if selected_group %}
+          <input type="hidden" name="group_id" value="{{ selected_group.id }}" />
+        {% endif %}
+        <input type="hidden" name="action" value="import_csv" />
+        <input type="file" name="csv_file" accept=".csv,text/csv"
+               class="text-xs border border-slate-300 rounded-lg px-2 py-1.5 bg-white" />
+        <button type="submit" class="border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm px-3 py-1.5 rounded-lg">
+          Import CSV
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <form method="post" class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+    {% csrf_token %}
+
+    <div class="px-5 py-4 border-b border-slate-100 bg-slate-50 flex items-end gap-4 flex-wrap">
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">User Scope</label>
+        <p class="text-sm text-slate-700">{{ request.user.username }}</p>
+      </div>
+
+      {% if can_manage_group_tokens %}
+      <div>
+        <label for="group_id" class="block text-xs font-medium text-slate-500 mb-1">Department Scope (Group)</label>
+        <select id="group_id" name="group_id"
+                class="border border-slate-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:ring-2 focus:ring-compass-500 outline-none">
+          {% if groups %}
+            {% for group in groups %}
+              <option value="{{ group.id }}" {% if selected_group and selected_group.id == group.id %}selected{% endif %}>{{ group.name }}</option>
+            {% endfor %}
+          {% else %}
+            <option value="">No groups</option>
+          {% endif %}
+        </select>
+        <button type="submit" formmethod="get"
+                class="ml-2 border border-slate-300 text-slate-600 hover:bg-slate-50 text-sm px-3 py-1.5 rounded-lg">
+          Load
+        </button>
+      </div>
+      {% endif %}
+
+      <div class="ml-auto">
+        <button type="submit" class="bg-compass-600 hover:bg-compass-700 text-white text-sm font-medium px-4 py-2 rounded-lg">
+          Save Values
+        </button>
+      </div>
+    </div>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm min-w-[960px]">
+        <thead>
+          <tr class="border-b border-slate-200 bg-slate-50 text-left">
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Token</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Global (Read-Only)</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Department</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">User</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Effective</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100">
+          {% for row in token_rows %}
+          <tr class="hover:bg-slate-50">
+            <td class="px-4 py-3 align-top">
+              <p class="font-mono text-xs text-slate-700">{{ row.key }}</p>
+              <p class="text-sm text-slate-700 font-medium">{{ row.label }}</p>
+              {% if row.description %}
+                <p class="text-xs text-slate-400 mt-0.5">{{ row.description }}</p>
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 align-top text-slate-600">{{ row.global_value|default:"—" }}</td>
+            <td class="px-4 py-3 align-top">
+              {% if can_manage_group_tokens and selected_group %}
+                <input type="text" name="group_{{ row.id }}" value="{{ row.group_value }}"
+                       class="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+              {% else %}
+                <span class="text-slate-600">{{ row.group_value|default:"—" }}</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 align-top">
+              <input type="text" name="user_{{ row.id }}" value="{{ row.user_value }}"
+                     class="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            </td>
+            <td class="px-4 py-3 align-top text-slate-700">
+              {% if row.user_value %}
+                {{ row.user_value }} <span class="text-xs text-slate-400">(User)</span>
+              {% elif row.group_value %}
+                {{ row.group_value }} <span class="text-xs text-slate-400">(Department)</span>
+              {% elif row.global_value %}
+                {{ row.global_value }} <span class="text-xs text-slate-400">(Global)</span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+          </tr>
+          {% empty %}
+          <tr>
+            <td colspan="5" class="px-4 py-8 text-center text-slate-500">
+              No active token definitions found. Add token definitions in Django admin first.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </form>
+
+  <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-100 bg-slate-50">
+      <h3 class="font-semibold text-slate-700">Recent Token Change Log</h3>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm min-w-[960px]">
+        <thead>
+          <tr class="border-b border-slate-200 bg-slate-50 text-left">
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">When</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Token</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Scope</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Action</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Old</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">New</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">By</th>
+            <th class="px-4 py-3 font-medium text-slate-500 text-xs uppercase tracking-wide">Source</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100">
+          {% for log in recent_audit_logs %}
+          <tr class="hover:bg-slate-50">
+            <td class="px-4 py-3 text-slate-600">{{ log.created_at|date:"d M Y H:i" }}</td>
+            <td class="px-4 py-3 font-mono text-xs text-slate-700">{{ log.definition.key }}</td>
+            <td class="px-4 py-3 text-slate-700">
+              {{ log.scope }}
+              {% if log.group %}<span class="text-xs text-slate-500">({{ log.group.name }})</span>{% endif %}
+              {% if log.user %}<span class="text-xs text-slate-500">({{ log.user.username }})</span>{% endif %}
+            </td>
+            <td class="px-4 py-3 text-slate-700">{{ log.action }}</td>
+            <td class="px-4 py-3 text-slate-600">{{ log.old_value|default:"—" }}</td>
+            <td class="px-4 py-3 text-slate-700">{{ log.new_value|default:"—" }}</td>
+            <td class="px-4 py-3 text-slate-600">{{ log.actor.username|default:"system" }}</td>
+            <td class="px-4 py-3 text-slate-500 text-xs">{{ log.source }}</td>
+          </tr>
+          {% empty %}
+          <tr>
+            <td colspan="8" class="px-4 py-8 text-center text-slate-500">No token changes recorded yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

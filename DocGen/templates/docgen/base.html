@@ -97,6 +97,15 @@
         <span x-show="sidebarOpen" x-cloak>Templates</span>
       </a>
 
+      <a href="{% url 'docgen:ui-token-registry' %}"
+         class="flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-md mx-2 mb-1
+                {% if url_name == 'ui-token-registry' %}bg-compass-600 text-white{% else %}text-compass-200 hover:bg-compass-700 hover:text-white{% endif %}">
+        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 6h14M5 18h14" />
+        </svg>
+        <span x-show="sidebarOpen" x-cloak>Token Registry</span>
+      </a>
+
       {% endwith %}
     </nav>
 
