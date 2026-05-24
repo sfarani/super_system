@@ -42,6 +42,8 @@ from .models import (
     TemplateWorkflowStage,
     TokenScope,
     WorkflowActionType,
+    WorkflowActorType,
+    WorkflowStageMode,
 )
 
 
@@ -409,7 +411,7 @@ def document_detail_ui(request, document_id: int):
         ]
         available_actions.append("reject")
     elif status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL):
-        workflow_warning = "This document is in a review state but has no active workflow stages. Configure template workflow stages and resubmit the document."
+        workflow_warning = "This document is in a review state but has no active workflow stages. Add document-level workflow stages (or update template workflow) and resubmit the document."
 
     # Determine which tabs to show
     tabs = [
@@ -444,6 +446,13 @@ def document_detail_ui(request, document_id: int):
         "pdf_list": pdf_list,
         "available_actions": available_actions,
         "workflow_warning": workflow_warning,
+        "can_configure_document_workflow": (
+            status in (DocumentStatus.DRAFT, DocumentStatus.RETURNED)
+            or (status in (DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL) and not has_active_workflow_stage)
+        ),
+        "workflow_mode_choices": [m.value for m in WorkflowStageMode],
+        "workflow_actor_type_choices": [a.value for a in WorkflowActorType],
+        "workflow_action_choices": [a.value for a in WorkflowActionType],
         "tabs": tabs,
     })
 

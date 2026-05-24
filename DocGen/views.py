@@ -184,6 +184,16 @@ def _archive_retention_days(document_type: str = "") -> int:
 	return int(getattr(django_settings, "DOCGEN_DEFAULT_ARCHIVE_DAYS", 365))
 
 
+def _can_edit_document_workflow(document: Document) -> bool:
+	if document.status in [DocumentStatus.DRAFT, DocumentStatus.RETURNED]:
+		return True
+	if document.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL]:
+		return not document.workflow_stages.filter(
+			status__in=[DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL]
+		).exists()
+	return False
+
+
 def _coerce_positive_int(value, default: int, max_value: int) -> int:
 	try:
 		parsed = int(value)
@@ -724,11 +734,12 @@ def document_submit(request, document_id: int):
 	if document.status not in [DocumentStatus.DRAFT, DocumentStatus.RETURNED]:
 		return JsonResponse({"error": "Only draft or returned documents can be submitted."}, status=400)
 
+	configured_document_stages = list(document.workflow_stages.order_by("stage_order", "id"))
 	template_stages = list(document.template_revision.workflow_stages.order_by("stage_order", "id"))
-	if not template_stages:
+	if not configured_document_stages and not template_stages:
 		return JsonResponse(
 			{
-				"error": "Cannot submit document because no workflow stages are configured on the template revision. Configure workflow stages first.",
+				"error": "Cannot submit document because no workflow stages are configured. Add document workflow stages or configure the template revision workflow first.",
 			},
 			status=400,
 		)
@@ -745,29 +756,66 @@ def document_submit(request, document_id: int):
 	)
 	document.save(update_fields=["submitted_at", "metadata", "updated_at"])
 
-	document.workflow_stages.all().delete()
-	first_stage_order = template_stages[0].stage_order if template_stages else None
-	for stage in template_stages:
-		stage_status = DocumentStatus.DRAFT
-		if stage.stage_order == first_stage_order:
-			stage_status = _route_status_for_stage(stage.required_action)
-			route_status = stage_status
-		resolved_actor_value = resolve_workflow_actor(
-			actor_type=stage.actor_type,
-			actor_value=stage.actor_value,
-			document=document,
-		)
-		DocumentWorkflowStage.objects.create(
-			document=document,
-			stage_order=stage.stage_order,
-			title=stage.title,
-			execution_mode=stage.mode,
-			actor_type=stage.actor_type,
-			actor_value=resolved_actor_value,
-			required_action=stage.required_action,
-			status=stage_status,
-			due_at=timezone.now() + timedelta(hours=stage.sla_hours),
-		)
+	if configured_document_stages:
+		first_stage_order = configured_document_stages[0].stage_order
+		now = timezone.now()
+		for stage in configured_document_stages:
+			stage_status = DocumentStatus.DRAFT
+			if stage.stage_order == first_stage_order:
+				stage_status = _route_status_for_stage(stage.required_action)
+				route_status = stage_status
+			resolved_actor_value = resolve_workflow_actor(
+				actor_type=stage.actor_type,
+				actor_value=stage.actor_value,
+				document=document,
+			)
+			stage.actor_value = resolved_actor_value
+			stage.status = stage_status
+			stage.acted_by = None
+			stage.acted_at = None
+			stage.reminder_sent_at = None
+			stage.escalated_at = None
+			stage.escalation_level = 0
+			stage.comments = ""
+			stage.due_at = now + timedelta(hours=48)
+			stage.save(
+				update_fields=[
+					"actor_value",
+					"status",
+					"acted_by",
+					"acted_at",
+					"reminder_sent_at",
+					"escalated_at",
+					"escalation_level",
+					"comments",
+					"due_at",
+					"updated_at",
+				]
+			)
+	else:
+		document.workflow_stages.all().delete()
+		first_stage_order = template_stages[0].stage_order if template_stages else None
+		for stage in template_stages:
+			stage_status = DocumentStatus.DRAFT
+			if stage.stage_order == first_stage_order:
+				stage_status = _route_status_for_stage(stage.required_action)
+				route_status = stage_status
+			resolved_actor_value = resolve_workflow_actor(
+				actor_type=stage.actor_type,
+				actor_value=stage.actor_value,
+				document=document,
+			)
+			DocumentWorkflowStage.objects.create(
+				document=document,
+				stage_order=stage.stage_order,
+				title=stage.title,
+				execution_mode=stage.mode,
+				actor_type=stage.actor_type,
+				actor_value=resolved_actor_value,
+				required_action=stage.required_action,
+				status=stage_status,
+				due_at=timezone.now() + timedelta(hours=stage.sla_hours),
+			)
 
 	document.status = route_status
 	document.save(update_fields=["status", "updated_at"])
@@ -1575,12 +1623,74 @@ def document_withdraw(request, document_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Document workflow stages list
+# Document workflow stages list + create
 # ---------------------------------------------------------------------------
 
-@require_GET
+@require_http_methods(["GET", "POST"])
 def document_workflow(request, document_id: int):
 	document = get_object_or_404(Document, pk=document_id)
+
+	if request.method == "POST":
+		auth_error = _authorize_docgen_action(
+			request,
+			{"docgen.originator", "docgen.admin"},
+		)
+		if auth_error is not None:
+			return auth_error
+
+		if not _can_edit_document_workflow(document):
+			return JsonResponse(
+				{"error": "Document workflow can be edited only in DRAFT/RETURNED, or during recovery when no active workflow stage exists."},
+				status=400,
+			)
+
+		try:
+			payload = _parse_json_request(request)
+		except ValidationError as error:
+			return JsonResponse({"error": str(error)}, status=400)
+
+		required_fields = ["stage_order", "title", "actor_type", "actor_value", "required_action"]
+		if any(payload.get(field_name) in [None, ""] for field_name in required_fields):
+			return JsonResponse(
+				{"error": "stage_order, title, actor_type, actor_value, and required_action are required."},
+				status=400,
+			)
+
+		if payload.get("replace_existing") is True:
+			document.workflow_stages.all().delete()
+
+		mode = payload.get("execution_mode", payload.get("mode", "SEQUENTIAL"))
+		try:
+			stage = DocumentWorkflowStage(
+				document=document,
+				stage_order=payload.get("stage_order"),
+				title=payload.get("title"),
+				execution_mode=mode,
+				actor_type=payload.get("actor_type"),
+				actor_value=payload.get("actor_value"),
+				required_action=payload.get("required_action"),
+				status=DocumentStatus.DRAFT,
+			)
+			stage.full_clean()
+			stage.save()
+		except (ValidationError, IntegrityError) as error:
+			return JsonResponse({"error": str(error)}, status=400)
+
+		return JsonResponse(
+			{
+				"id": stage.id,
+				"document_id": document.id,
+				"stage_order": stage.stage_order,
+				"title": stage.title,
+				"execution_mode": stage.execution_mode,
+				"actor_type": stage.actor_type,
+				"actor_value": stage.actor_value,
+				"required_action": stage.required_action,
+				"status": stage.status,
+			},
+			status=201,
+		)
+
 	stages = [
 		{
 			"id": s.id,
@@ -1607,6 +1717,61 @@ def document_workflow(request, document_id: int):
 			"document_status": document.status,
 			"count": len(stages),
 			"stages": stages,
+		}
+	)
+
+
+@require_http_methods(["PATCH", "DELETE"])
+def document_workflow_stage_detail(request, document_id: int, stage_id: int):
+	auth_error = _authorize_docgen_action(
+		request,
+		{"docgen.originator", "docgen.admin"},
+	)
+	if auth_error is not None:
+		return auth_error
+
+	document = get_object_or_404(Document, pk=document_id)
+	stage = get_object_or_404(DocumentWorkflowStage, pk=stage_id, document=document)
+
+	if not _can_edit_document_workflow(document):
+		return JsonResponse(
+			{"error": "Document workflow can be edited only in DRAFT/RETURNED, or during recovery when no active workflow stage exists."},
+			status=400,
+		)
+
+	if request.method == "DELETE":
+		stage.delete()
+		return JsonResponse({}, status=204)
+
+	try:
+		payload = _parse_json_request(request)
+	except ValidationError as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	for field_name in ["stage_order", "title", "execution_mode", "actor_type", "actor_value", "required_action"]:
+		if field_name in payload:
+			setattr(stage, field_name, payload[field_name])
+
+	if "mode" in payload:
+		stage.execution_mode = payload["mode"]
+
+	try:
+		stage.full_clean()
+		stage.save()
+	except (ValidationError, IntegrityError) as error:
+		return JsonResponse({"error": str(error)}, status=400)
+
+	return JsonResponse(
+		{
+			"id": stage.id,
+			"document_id": document.id,
+			"stage_order": stage.stage_order,
+			"title": stage.title,
+			"execution_mode": stage.execution_mode,
+			"actor_type": stage.actor_type,
+			"actor_value": stage.actor_value,
+			"required_action": stage.required_action,
+			"status": stage.status,
 		}
 	)
 

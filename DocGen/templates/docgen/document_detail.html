@@ -57,6 +57,17 @@
   saving: false,
   actionSubmitting: false,
   actionError: '',
+  workflowStageModal: false,
+  workflowStageSubmitting: false,
+  workflowStageError: '',
+  workflowStageForm: {
+    stage_order: 1,
+    title: '',
+    execution_mode: 'SEQUENTIAL',
+    actor_type: 'USER',
+    actor_value: '',
+    required_action: 'REVIEW'
+  },
 
   init() {
     if (!Array.isArray(this.tokenRows)) this.tokenRows = [];
@@ -324,6 +335,44 @@
     });
     if (resp.ok) { window.location.reload(); }
     else { const d = await resp.json(); alert(d.error || 'Archive failed.'); }
+  },
+
+  async saveWorkflowStage() {
+    this.workflowStageSubmitting = true;
+    this.workflowStageError = '';
+    const resp = await fetch('{% url "docgen:document-workflow" document.id %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+      body: JSON.stringify({
+        stage_order: parseInt(this.workflowStageForm.stage_order) || 1,
+        title: this.workflowStageForm.title,
+        execution_mode: this.workflowStageForm.execution_mode,
+        actor_type: this.workflowStageForm.actor_type,
+        actor_value: this.workflowStageForm.actor_value,
+        required_action: this.workflowStageForm.required_action,
+      })
+    });
+    this.workflowStageSubmitting = false;
+    if (resp.ok) {
+      window.location.reload();
+      return;
+    }
+    const d = await resp.json().catch(() => ({}));
+    this.workflowStageError = d.error || 'Failed to add workflow stage.';
+  },
+
+  async deleteWorkflowStage(stageId) {
+    if (!confirm('Delete this workflow stage?')) return;
+    const resp = await fetch('{% url "docgen:document-workflow-stage-detail" document.id 0 %}'.replace('/0/', '/' + stageId + '/'), {
+      method: 'DELETE',
+      headers: { 'X-CSRFToken': this.csrfToken() }
+    });
+    if (resp.ok) {
+      window.location.reload();
+      return;
+    }
+    const d = await resp.json().catch(() => ({}));
+    alert(d.error || 'Failed to delete workflow stage.');
   }
 }">
 
@@ -697,6 +746,15 @@
   <!-- TAB: Workflow -->
   <div x-show="activeTab === 'workflow'" x-cloak>
     <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+      {% if can_configure_document_workflow %}
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <p class="text-xs text-slate-500">Define document-specific workflow stages. These override template workflow on submit/resubmit.</p>
+          <button @click="workflowStageModal = true"
+                  class="text-sm bg-compass-600 hover:bg-compass-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+            + Add Stage
+          </button>
+        </div>
+      {% endif %}
       {% if workflow_warning %}
         <div class="px-5 py-4 border-b border-amber-200 bg-amber-50 text-amber-800 text-sm flex items-center justify-between gap-3">
           <span>{{ workflow_warning }}</span>
@@ -748,6 +806,12 @@
                   Due: {{ stage.due_at|date:"d M Y H:i" }}
                   {% if stage.escalated_at %}<span class="text-red-500 font-medium ml-2">Escalated</span>{% endif %}
                 </p>
+              {% endif %}
+              {% if can_configure_document_workflow %}
+                <div class="mt-2">
+                  <button @click="deleteWorkflowStage({{ stage.id }})"
+                          class="text-xs text-red-500 hover:text-red-700">Delete Stage</button>
+                </div>
               {% endif %}
             </div>
           </div>
@@ -969,6 +1033,68 @@
   </div>
 
 <!-- ========== MODALS ========== -->
+
+  <!-- Workflow stage modal -->
+  <div x-show="workflowStageModal" x-cloak x-transition
+       class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6" @click.stop>
+      <h3 class="font-semibold text-slate-800 mb-4">Add Workflow Stage</h3>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Stage Order</label>
+          <input type="number" min="1" x-model="workflowStageForm.stage_order"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Execution Mode</label>
+          <select x-model="workflowStageForm.execution_mode"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            {% for mode in workflow_mode_choices %}
+              <option value="{{ mode }}">{{ mode }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-xs font-medium text-slate-500 mb-1">Title</label>
+          <input type="text" x-model="workflowStageForm.title"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Actor Type</label>
+          <select x-model="workflowStageForm.actor_type"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            {% for actor_type in workflow_actor_type_choices %}
+              <option value="{{ actor_type }}">{{ actor_type }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Required Action</label>
+          <select x-model="workflowStageForm.required_action"
+                  class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none bg-white">
+            {% for action in workflow_action_choices %}
+              <option value="{{ action }}">{{ action }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-xs font-medium text-slate-500 mb-1">Actor Value</label>
+          <input type="text" x-model="workflowStageForm.actor_value" placeholder="username, role, or dynamic token"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+        </div>
+      </div>
+      <template x-if="workflowStageError">
+        <p class="text-xs text-red-600 mt-3" x-text="workflowStageError"></p>
+      </template>
+      <div class="flex gap-3 justify-end mt-5">
+        <button @click="workflowStageModal = false; workflowStageError = ''"
+                class="text-sm border border-slate-300 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+        <button @click="saveWorkflowStage()" :disabled="workflowStageSubmitting"
+                class="text-sm bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg"
+                x-text="workflowStageSubmitting ? 'Saving…' : 'Save Stage'"></button>
+      </div>
+    </div>
+  </div>
 
 <!-- Submit confirmation -->
 <div x-show="submitModal" x-cloak x-transition

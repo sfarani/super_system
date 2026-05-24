@@ -43,6 +43,7 @@ urlpatterns = [
 
     # Document workflow, PDF, QR
     path("documents/<int:document_id>/workflow/", views.document_workflow, name="document-workflow"),
+    path("documents/<int:document_id>/workflow-stages/<int:stage_id>/", views.document_workflow_stage_detail, name="document-workflow-stage-detail"),
     path("documents/<int:document_id>/pdf/", views.document_pdf_list, name="document-pdf-list"),
     path("documents/<int:document_id>/pdf/<int:pdf_id>/download/", views.document_pdf_download, name="document-pdf-download"),
     path("documents/<int:document_id>/preview/", views.document_preview, name="document-preview"),
