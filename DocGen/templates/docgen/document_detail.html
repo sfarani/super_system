@@ -2,6 +2,13 @@
 {% load static %}
 
 {% block title %}{{ document.title|truncatechars:40 }} — DocGen{% endblock %}
+{% block extra_head %}
+  <link href="https://cdn.jsdelivr.net/npm/quill@1.3.7/dist/quill.snow.css" rel="stylesheet">
+  <style>
+    .docgen-quill .ql-toolbar.ql-snow { border: 0; border-bottom: 1px solid #e2e8f0; }
+    .docgen-quill .ql-container.ql-snow { border: 0; min-height: 11rem; font-size: 0.875rem; }
+  </style>
+{% endblock %}
 {% block page_title %}
   <span class="font-mono text-sm text-slate-500 mr-2">{{ document.reference_number|default:"DRAFT" }}</span>
   {{ document.title|truncatechars:60 }}
@@ -35,19 +42,62 @@
   editSubject: '{{ document.subject|escapejs }}',
   editClassification: '{{ document.classification|escapejs }}',
   fieldsData: {{ fields_json }},
+  fieldsRichData: {{ fields_rich_json|default:'{}' }},
+  quillEditors: {},
+  quillSaveTimers: {},
   templateTokens: {{ template_tokens_json }},
+  tokenRows: {{ token_table_rows_json|default:'[]' }},
   inheritedTokens: {{ inherited_tokens_json }},
   inheritedTokenSources: {{ inherited_token_sources_json }},
-  templateTokensRaw: '',
   tokenSaving: false,
   saving: false,
   actionSubmitting: false,
   actionError: '',
 
   init() {
-    this.templateTokensRaw = Object.entries(this.templateTokens || {})
-      .map(([k, v]) => `${k}=${v ?? ''}`)
-      .join('\n');
+    if (!Array.isArray(this.tokenRows)) this.tokenRows = [];
+    this.$nextTick(() => this.initBodyRichTextEditor());
+  },
+
+  isEditableStatus() {
+    return ['DRAFT', 'RETURNED'].includes('{{ document.status }}');
+  },
+
+  initBodyRichTextEditor() {
+    if (!this.isEditableStatus() || !window.Quill) return;
+    const fieldName = 'body_text';
+    const host = document.getElementById('quill-body-text');
+    if (!host || this.quillEditors[fieldName]) return;
+
+    const quill = new window.Quill(host, {
+      theme: 'snow',
+      modules: {
+        toolbar: [
+          [{ header: [1, 2, false] }],
+          ['bold', 'italic', 'underline'],
+          [{ list: 'ordered' }, { list: 'bullet' }],
+          ['clean']
+        ]
+      }
+    });
+
+    const existingDelta = this.fieldsRichData[fieldName];
+    if (existingDelta && typeof existingDelta === 'object') {
+      quill.setContents(existingDelta);
+    } else if (this.fieldsData[fieldName]) {
+      quill.root.innerHTML = this.fieldsData[fieldName];
+    }
+
+    quill.on('text-change', () => {
+      this.fieldsData[fieldName] = quill.root.innerHTML;
+      this.fieldsRichData[fieldName] = quill.getContents();
+      clearTimeout(this.quillSaveTimers[fieldName]);
+      this.quillSaveTimers[fieldName] = setTimeout(() => {
+        this.saveField(fieldName, this.fieldsData[fieldName], this.fieldsRichData[fieldName]);
+      }, 550);
+    });
+
+    this.quillEditors[fieldName] = quill;
   },
 
   get statusColor() {
@@ -69,6 +119,35 @@
     return document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '';
   },
 
+  tokenOverrideValue(row) {
+    return String(row && row.value ? row.value : '').trim();
+  },
+
+  tokenInheritedValue(row) {
+    if (!row || !row.key) return '';
+    return String(this.inheritedTokens && this.inheritedTokens[row.key] ? this.inheritedTokens[row.key] : '').trim();
+  },
+
+  tokenEffectiveValue(row) {
+    const overrideValue = this.tokenOverrideValue(row);
+    if (overrideValue) return overrideValue;
+    return this.tokenInheritedValue(row);
+  },
+
+  tokenEffectiveSource(row) {
+    if (this.tokenOverrideValue(row)) return 'Override';
+    if (this.tokenInheritedValue(row)) return this.inheritedTokenSources[row.key] || 'Inherited';
+    return 'Missing';
+  },
+
+  tokenIsRequired(row) {
+    return !!(row && row.used_in_layout);
+  },
+
+  tokenIsMissing(row) {
+    return this.tokenIsRequired(row) && !this.tokenEffectiveValue(row);
+  },
+
   async saveEdit() {
     this.saving = true;
     const resp = await fetch('{% url "docgen:document-detail" document.id %}', {
@@ -81,25 +160,26 @@
     else { alert('Save failed. Only DRAFT or RETURNED documents can be edited.'); }
   },
 
-  async saveField(placeholder_name, value) {
+  async saveField(placeholder_name, value, valueJson = null) {
+    const item = { placeholder_name, value_text: String(value ?? '') };
+    if (valueJson !== null) {
+      item.value_json = valueJson;
+    }
     await fetch('{% url "docgen:document-set-fields" document.id %}', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
-      body: JSON.stringify({ fields: [{ placeholder_name, value_text: String(value) }] })
+      body: JSON.stringify({ fields: [item] })
     });
   },
 
   async saveTemplateTokens() {
     this.tokenSaving = true;
     const parsed = {};
-    (this.templateTokensRaw || '').split('\n').forEach(line => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return;
-      const idx = trimmed.indexOf('=');
-      if (idx < 1) return;
-      const key = trimmed.slice(0, idx).trim();
-      const value = trimmed.slice(idx + 1).trim();
-      if (key) parsed[key] = value;
+    (this.tokenRows || []).forEach(row => {
+      const key = String(row && row.key ? row.key : '').trim();
+      if (!key) return;
+      const value = String(row && row.value ? row.value : '').trim();
+      if (value) parsed[key] = value;
     });
 
     const resp = await fetch('{% url "docgen:document-set-fields" document.id %}', {
@@ -347,9 +427,27 @@
           <div>
             <label class="block text-xs font-medium text-slate-600 mb-1">
               {{ ph.label }}{% if ph.is_required %} <span class="text-red-400">*</span>{% endif %}
+              {% if ph.name == 'body_text' and template_uses_body_block %}
+                <span class="ml-1 inline-flex items-center px-1.5 py-0.5 rounded bg-compass-100 text-compass-700 text-[10px] font-semibold tracking-wide uppercase">Rich Text Enabled</span>
+              {% endif %}
             </label>
             {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
-              {% if ph.field_type == 'LONG_TEXT' %}
+              {% if ph.name == 'body_text' and ph.field_type == 'LONG_TEXT' %}
+                <div class="border border-slate-300 rounded-lg overflow-hidden docgen-quill">
+                  <div id="quill-body-text"></div>
+                </div>
+                {% if template_uses_body_block %}
+                  <p class="mt-1 text-[11px] text-slate-500">Formatting guide: use headings for sections, bold for emphasis, and bullets for lists. Keep content clean for official PDF output.</p>
+                {% endif %}
+                <template x-if="!window.Quill">
+                  <textarea
+                    x-model="fieldsData['{{ ph.name }}']"
+                    @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
+                    rows="6"
+                    placeholder="{{ ph.label }}…"
+                    class="w-full mt-2 border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-compass-500 outline-none resize-y"></textarea>
+                </template>
+              {% elif ph.field_type == 'LONG_TEXT' %}
                 <textarea
                   x-model="fieldsData['{{ ph.name }}']"
                   @change="saveField('{{ ph.name }}', fieldsData['{{ ph.name }}'])"
@@ -379,9 +477,13 @@
               {% endif %}
             {% else %}
               <!-- Read-only display -->
-              <p class="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 min-h-[38px]">
-                <span x-text="fieldsData['{{ ph.name }}'] || '—'"></span>
-              </p>
+              {% if ph.name == 'body_text' %}
+                <div class="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 min-h-[60px] leading-relaxed" x-html="fieldsData['{{ ph.name }}'] || '<span class=\'text-slate-400\'>—</span>'"></div>
+              {% else %}
+                <p class="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 min-h-[38px]">
+                  <span x-text="fieldsData['{{ ph.name }}'] || '—'"></span>
+                </p>
+              {% endif %}
             {% endif %}
           </div>
           {% endfor %}
@@ -395,9 +497,7 @@
           <h3 class="font-semibold text-slate-700">Template Tokens ([])</h3>
         </div>
         <p class="text-xs text-slate-500 mb-3">
-          Provide optional token values used in layout blocks, one per line as
-          <span class="font-mono bg-slate-100 px-1 rounded">name=value</span>.
-          Example: <span class="font-mono bg-slate-100 px-1 rounded">department=Finance Wing</span>
+          Tokens are auto-detected from the selected template layout. Provide document-specific values below.
         </p>
 
         <div class="mb-3 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
@@ -414,22 +514,82 @@
         </div>
 
         {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
-          <textarea
-            x-model="templateTokensRaw"
-            rows="8"
-            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-compass-500 outline-none resize-y"
-            placeholder="department=Finance Wing&#10;recipient_title=Director General"></textarea>
+          <template x-if="tokenRows.length === 0">
+            <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-3 text-sm text-slate-500">
+              No editable template tokens detected in this layout.
+            </div>
+          </template>
+          <template x-if="tokenRows.length > 0">
+            <div class="border border-slate-200 rounded-lg overflow-hidden">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="bg-slate-50 border-b border-slate-200">
+                    <th class="text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Token</th>
+                    <th class="text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Value</th>
+                    <th class="text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Status</th>
+                    <th class="text-left px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Effective Value</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                  <template x-for="row in tokenRows" :key="row.key">
+                    <tr>
+                      <td class="px-3 py-2 align-top">
+                        <div class="flex items-center gap-1.5 flex-wrap">
+                          <span class="font-mono text-slate-700" x-text="row.key"></span>
+                          <template x-if="tokenIsRequired(row)">
+                            <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide"
+                                  :class="tokenIsMissing(row) ? 'bg-red-100 text-red-700' : 'bg-slate-100 text-slate-600'"
+                                  x-text="tokenIsMissing(row) ? 'Required (Missing)' : 'Required'"></span>
+                          </template>
+                        </div>
+                      </td>
+                      <td class="px-3 py-2 align-top">
+                        <input type="text"
+                               x-model="row.value"
+                               :placeholder="(inheritedTokens[row.key] || '')"
+                               :class="tokenIsMissing(row) ? 'border-red-300 focus:ring-red-400' : 'border-slate-300 focus:ring-compass-500'"
+                               class="w-full border rounded px-2.5 py-1.5 text-sm outline-none" />
+                        <template x-if="inheritedTokens[row.key]">
+                          <p class="mt-1 text-[11px] text-slate-500">
+                            Inherited default: <span class="font-mono" x-text="inheritedTokens[row.key]"></span>
+                          </p>
+                        </template>
+                      </td>
+                      <td class="px-3 py-2 align-top">
+                        <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide"
+                              :class="row.used_in_layout ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'"
+                              x-text="row.used_in_layout ? 'Used' : 'Saved (Not in layout)'"></span>
+                      </td>
+                      <td class="px-3 py-2 align-top">
+                        <template x-if="tokenEffectiveValue(row)">
+                          <div>
+                            <p class="text-slate-700 break-words" x-text="tokenEffectiveValue(row)"></p>
+                            <p class="mt-0.5 text-[11px] text-slate-500" x-text="tokenEffectiveSource(row)"></p>
+                          </div>
+                        </template>
+                        <template x-if="!tokenEffectiveValue(row)">
+                          <p class="text-red-600 text-xs font-medium">Missing value</p>
+                        </template>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
           <button @click="saveTemplateTokens()" :disabled="tokenSaving"
                   class="mt-3 bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg">
             <span x-text="tokenSaving ? 'Saving…' : 'Save Tokens'"></span>
           </button>
         {% else %}
           <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-            <template x-if="Object.keys(templateTokens || {}).length === 0">
+            <template x-if="tokenRows.length === 0">
               <p class="text-sm text-slate-500">No custom [] token values set.</p>
             </template>
-            <template x-for="(value, key) in templateTokens" :key="key">
-              <p class="text-sm text-slate-700"><span class="font-mono" x-text="key"></span>=<span x-text="value"></span></p>
+            <template x-for="row in tokenRows" :key="row.key + '-ro'">
+              <template x-if="tokenEffectiveValue(row)">
+                <p class="text-sm text-slate-700"><span class="font-mono" x-text="row.key"></span>=<span x-text="tokenEffectiveValue(row)"></span></p>
+              </template>
             </template>
           </div>
         {% endif %}
@@ -778,4 +938,8 @@
   </div>
 </div>
 
+{% endblock %}
+
+{% block extra_js %}
+  <script defer src="https://cdn.jsdelivr.net/npm/quill@1.3.7/dist/quill.min.js"></script>
 {% endblock %}

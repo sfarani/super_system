@@ -1,6 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 
 import base64
+from html.parser import HTMLParser
 from io import BytesIO
 import hashlib
 import json
@@ -34,6 +35,68 @@ from .notifications import LocalNotificationAdapter
 
 _TOKEN_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 _BRACKET_TOKEN_RE = re.compile(r"\[(\w+)\]")
+_RICH_TEXT_ALLOWED_TAGS = {"p", "br", "strong", "b", "em", "i", "u", "ol", "ul", "li", "sub", "sup", "blockquote"}
+_RICH_TEXT_VOID_TAGS = {"br"}
+
+
+class _RichTextSanitizer(HTMLParser):
+    """Minimal allow-list HTML sanitizer for document body content."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._parts: list[str] = []
+        self._open_tags: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        _ = attrs
+        normalized = str(tag or "").lower()
+        if normalized not in _RICH_TEXT_ALLOWED_TAGS:
+            return
+        self._parts.append(f"<{normalized}>")
+        if normalized not in _RICH_TEXT_VOID_TAGS:
+            self._open_tags.append(normalized)
+
+    def handle_startendtag(self, tag, attrs):
+        _ = attrs
+        normalized = str(tag or "").lower()
+        if normalized not in _RICH_TEXT_ALLOWED_TAGS:
+            return
+        if normalized in _RICH_TEXT_VOID_TAGS:
+            self._parts.append(f"<{normalized}/>")
+            return
+        self._parts.append(f"<{normalized}></{normalized}>")
+
+    def handle_endtag(self, tag):
+        normalized = str(tag or "").lower()
+        if normalized not in _RICH_TEXT_ALLOWED_TAGS or normalized in _RICH_TEXT_VOID_TAGS:
+            return
+        if normalized in self._open_tags:
+            while self._open_tags:
+                open_tag = self._open_tags.pop()
+                self._parts.append(f"</{open_tag}>")
+                if open_tag == normalized:
+                    break
+
+    def handle_data(self, data):
+        self._parts.append(escape(data or ""))
+
+    def handle_entityref(self, name):
+        self._parts.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self._parts.append(f"&#{name};")
+
+    def get_html(self) -> str:
+        while self._open_tags:
+            self._parts.append(f"</{self._open_tags.pop()}>")
+        return "".join(self._parts)
+
+
+def sanitize_rich_text_html(raw_html: str) -> str:
+    parser = _RichTextSanitizer()
+    parser.feed(str(raw_html or ""))
+    parser.close()
+    return parser.get_html()
 
 
 def _coerce_text_value(value_text, value_json) -> str:
@@ -235,14 +298,44 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
 
     right_logo_src = _resolve_logo_src(selected_right_logo_url)
 
-    def _block_style(block_type: str, align: str, split_mode: bool = False) -> str:
+    def _resolve_pdf_font(font_key: str) -> str:
+        key = str(font_key or "helvetica").lower()
+        if key == "times":
+            return "Times-Roman"
+        if key == "courier":
+            return "Courier"
+        return "Helvetica"
+
+    def _default_font_size(block_type: str) -> float:
+        if block_type == "letterhead":
+            return 13.0
+        if block_type == "reference_line":
+            return 10.0
+        if block_type == "contacts_block":
+            return 10.0
+        if block_type == "footer":
+            return 9.0
+        return 11.0
+
+    def _resolve_font_size(block_type: str, raw_size) -> float:
+        try:
+            parsed = float(raw_size)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+        return _default_font_size(block_type)
+
+    def _block_style(block_type: str, align: str, font_key: str, font_size, split_mode: bool = False) -> str:
         style = "margin-bottom:10px;white-space:normal;"
+        style += f"font-family:{_resolve_pdf_font(font_key)};"
+        style += f"font-size:{_resolve_font_size(block_type, font_size)}pt;"
         if not split_mode and align in {"left", "center", "right"}:
             style += f"text-align:{align};"
         if block_type == "letterhead":
-            style += "font-weight:700;font-size:13pt;line-height:1.35;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:16px;"
+            style += "font-weight:700;line-height:1.35;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:16px;"
         elif block_type == "reference_line":
-            style += "font-size:10pt;color:#333;margin-bottom:8px;"
+            style += "color:#333;margin-bottom:8px;"
         elif block_type == "subject_line":
             style += "font-weight:700;text-decoration:underline;margin-top:10px;margin-bottom:12px;"
         elif block_type == "salutation":
@@ -252,13 +345,13 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
             if not split_mode:
                 style += "text-align:justify;"
         elif block_type == "contacts_block":
-            style += "font-size:10pt;white-space:nowrap;"
+            style += "white-space:nowrap;"
         elif block_type == "closing":
             style += "margin-top:14px;margin-bottom:8px;"
         elif block_type == "signature_block":
             style += "margin-top:26px;line-height:1.4;"
         elif block_type == "footer":
-            style += "font-size:9pt;color:#555;border-top:1px solid #ccc;padding-top:6px;margin-top:20px;"
+            style += "color:#555;border-top:1px solid #ccc;padding-top:6px;margin-top:20px;"
         return style
 
     parts: list[str] = []
@@ -267,48 +360,68 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
             continue
         block_type = str(block.get("type") or "custom")
         align = str(block.get("align") or "left")
+        font_key = str(block.get("font_family") or "helvetica")
+        font_size = block.get("font_size")
         content = _render_template_tokens(str(block.get("content") or ""), render_context)
 
         if block_type == "letterhead":
             content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
             left_img_html = (
-                f"<img src='{escape(left_logo_src)}' style='height:48px;max-width:140px;' />"
+                f"<img src='{escape(left_logo_src)}' style='height:64px;max-width:190px;' />"
                 if left_logo_src
                 else ""
             )
             right_img_html = (
-                f"<img src='{escape(right_logo_src)}' style='height:48px;max-width:140px;' />"
+                f"<img src='{escape(right_logo_src)}' style='height:64px;max-width:190px;' />"
                 if right_logo_src
                 else ""
             )
+            text_align = align if align in {"left", "center", "right"} else "left"
             if right_img_html:
                 row_html = (
                     "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
                     "<tr>"
                     f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
-                    f"<td style='width:60%;text-align:center;vertical-align:top;'>{content_html}</td>"
+                    f"<td style='width:60%;text-align:{text_align};vertical-align:top;'>{content_html}</td>"
                     f"<td style='width:20%;text-align:right;vertical-align:top;'>{right_img_html}</td>"
                     "</tr>"
                     "</table>"
                 )
             else:
-                row_html = (
-                    "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
-                    "<tr>"
-                    f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
-                    f"<td style='width:80%;text-align:center;vertical-align:top;'>{content_html}</td>"
-                    "</tr>"
-                    "</table>"
-                )
-            style = _block_style(block_type, align, split_mode=False)
+                if text_align == "center":
+                    row_html = (
+                        "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+                        "<tr>"
+                        f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
+                        f"<td style='width:60%;text-align:center;vertical-align:top;'>{content_html}</td>"
+                        "<td style='width:20%;text-align:right;vertical-align:top;'></td>"
+                        "</tr>"
+                        "</table>"
+                    )
+                else:
+                    row_html = (
+                        "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+                        "<tr>"
+                        f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
+                        f"<td style='width:80%;text-align:{text_align};vertical-align:top;'>{content_html}</td>"
+                        "</tr>"
+                        "</table>"
+                    )
+            style = _block_style(block_type, align, font_key, font_size, split_mode=False)
             parts.append(f"<div style='{style}'>{row_html}</div>")
+            continue
+
+        if block_type == "body":
+            content_html = sanitize_rich_text_html(content)
+            style = _block_style(block_type, align, font_key, font_size, split_mode=False)
+            parts.append(f"<div style='{style}'>{content_html}</div>")
             continue
 
         if "||" in content:
             left_raw, right_raw = content.split("||", 1)
             left_html = escape(left_raw.strip()).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
             right_html = escape(right_raw.strip()).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-            style = _block_style(block_type, align, split_mode=True)
+            style = _block_style(block_type, align, font_key, font_size, split_mode=True)
             parts.append(
                 f"<div style='{style}'>"
                 "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
@@ -322,7 +435,7 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
             continue
 
         content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-        style = _block_style(block_type, align, split_mode=False)
+        style = _block_style(block_type, align, font_key, font_size, split_mode=False)
 
         parts.append(f"<div style='{style}'>{content_html}</div>")
 

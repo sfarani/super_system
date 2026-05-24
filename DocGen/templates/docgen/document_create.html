@@ -17,6 +17,8 @@
     fields: {}
   },
   placeholders: {{ placeholders_json|default:'[]' }},
+  createdDocumentId: null,
+  createdDocumentUrl: '',
   submitting: false,
   errors: {},
 
@@ -25,6 +27,17 @@
     this.selectedRevisionId = revId;
     this.templateId = templateId;
     this.step = 2;
+  },
+
+  resetForm() {
+    this.step = 1;
+    this.selectedRevision = null;
+    this.selectedRevisionId = null;
+    this.templateId = null;
+    this.form = { template_revision_id: null, document_type: '', title: '', subject: '', fields: {} };
+    this.createdDocumentId = null;
+    this.createdDocumentUrl = '';
+    this.errors = {};
   },
 
   validateStep2() {
@@ -38,6 +51,8 @@
   async createDocument() {
     if (!this.validateStep2()) return;
     this.submitting = true;
+    this.createdDocumentId = null;
+    this.createdDocumentUrl = '';
     try {
       const resp = await fetch('{% url "docgen:document-collection" %}', {
         method: 'POST',
@@ -58,8 +73,10 @@
         this.submitting = false;
         return;
       }
-      // Redirect to the new document's detail/edit page
-      window.location.href = '/compass/docgen/ui/documents/' + data.id + '/';
+      this.createdDocumentId = data.id;
+      this.createdDocumentUrl = '/compass/docgen/ui/documents/' + data.id + '/';
+      this.submitting = false;
+      this.step = 3;
     } catch(e) {
       this.errors.server = 'Network error. Please try again.';
       this.submitting = false;
@@ -79,6 +96,12 @@
       <span :class="step >= 2 ? 'bg-compass-600 text-white' : 'bg-slate-200 text-slate-500'"
             class="w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0">2</span>
       <span :class="step >= 2 ? 'text-slate-800 font-medium' : 'text-slate-400'" class="text-sm">Document Details</span>
+    </li>
+    <div class="flex-1 h-px bg-slate-200 mx-3 max-w-12"></div>
+    <li class="flex items-center gap-2">
+      <span :class="step >= 3 ? 'bg-compass-600 text-white' : 'bg-slate-200 text-slate-500'"
+            class="w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0">3</span>
+      <span :class="step >= 3 ? 'text-slate-800 font-medium' : 'text-slate-400'" class="text-sm">Open Details</span>
     </li>
   </ol>
 
@@ -190,6 +213,38 @@
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
           </svg>
           <span x-text="submitting ? 'Creating…' : 'Create Document'"></span>
+        </button>
+        <a href="{% url 'docgen:ui-document-list' %}" class="mt-3 inline-block text-sm text-slate-500 hover:text-slate-700 hover:underline">
+          Go to Documents List
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 3: Success / Open detail -->
+  <div x-show="step === 3" x-cloak>
+    <div class="max-w-xl bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-5">
+      <div class="flex items-center gap-3 mb-2">
+        <h2 class="font-semibold text-slate-700">Document Created</h2>
+      </div>
+
+      <div class="bg-green-50 border border-green-200 text-green-800 text-sm rounded-lg px-4 py-3">
+        <p class="font-medium">Document created successfully.</p>
+        <p class="mt-1">Use the button below to open the document detail page and fill fields, tokens, and body text.</p>
+      </div>
+
+      <div class="space-y-3">
+        <a :href="createdDocumentUrl"
+           class="w-full inline-flex items-center justify-center bg-compass-600 hover:bg-compass-700 text-white font-medium py-2.5 rounded-lg transition-colors">
+          Open Document Details
+        </a>
+        <a href="{% url 'docgen:ui-document-list' %}"
+           class="w-full inline-flex items-center justify-center border border-slate-300 text-slate-700 hover:bg-slate-50 font-medium py-2.5 rounded-lg transition-colors">
+          Go to Documents List
+        </a>
+        <button @click="resetForm()"
+                class="w-full inline-flex items-center justify-center text-sm text-slate-500 hover:text-slate-700 hover:underline">
+          Create Another Document
         </button>
       </div>
     </div>

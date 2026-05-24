@@ -37,7 +37,13 @@ from .models import (
 	TemplateStatus,
 	TemplateWorkflowStage,
 )
-from .services import emit_notification_event, generate_pdf_artifact, generate_pdf_preview, resolve_workflow_actor
+from .services import (
+	emit_notification_event,
+	generate_pdf_artifact,
+	generate_pdf_preview,
+	resolve_workflow_actor,
+	sanitize_rich_text_html,
+)
 
 
 _DOCGEN_PERMISSION_PREFIX = f"{Template._meta.app_label}."
@@ -561,8 +567,15 @@ def document_set_fields(request, document_id: int):
 		placeholder_name = item.get("placeholder_name")
 		if not placeholder_name:
 			continue
-		value_text = item.get("value_text", "")
+		value_text = "" if item.get("value_text") is None else str(item.get("value_text", ""))
 		value_json = item.get("value_json", {})
+
+		# `body_text` is treated as rich text. Store a sanitized HTML projection in value_text,
+		# while retaining the editor payload (e.g., Quill Delta) in value_json.
+		if str(placeholder_name).strip().lower() == "body_text":
+			value_text = sanitize_rich_text_html(value_text)
+			if value_json in [None, ""]:
+				value_json = {}
 		DocumentField.objects.update_or_create(
 			document=document,
 			placeholder_name=placeholder_name,
@@ -579,13 +592,8 @@ def document_set_fields(request, document_id: int):
 				row["key"]: row
 				for row in TemplateTokenDefinition.objects.filter(is_active=True, key__in=requested_keys).values("key", "allow_document_override")
 			}
-			missing_keys = sorted(set(requested_keys) - set(definitions.keys()))
-			if missing_keys:
-				return JsonResponse(
-					{"error": f"Unknown template token keys: {', '.join(missing_keys)}"},
-					status=400,
-				)
-
+			# Allow ad-hoc layout tokens that are not present in central registry definitions.
+			# Restrict only those keys that are explicitly registered as non-overridable.
 			non_overridable = sorted(
 				key
 				for key in requested_keys

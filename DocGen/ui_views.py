@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from io import StringIO
 
 from django.conf import settings
@@ -82,6 +83,35 @@ def _optional_logo_options() -> list[dict[str, str]]:
         options.append({"key": key_str, "label": label, "url": url})
 
     return options
+
+
+_TOKEN_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+_BRACKET_TOKEN_RE = re.compile(r"\[(\w+)\]")
+_RESERVED_RENDER_TOKENS = {
+    "reference_number",
+    "date",
+    "title",
+    "subject",
+    "classification",
+    "originator",
+    "submitted_at",
+    "approved_at",
+}
+
+
+def _extract_layout_tokens(layout_schema: dict) -> set[str]:
+    blocks = layout_schema.get("blocks") if isinstance(layout_schema, dict) else None
+    if not isinstance(blocks, list):
+        return set()
+
+    found: set[str] = set()
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        content = str(block.get("content") or "")
+        found.update(match.group(1) for match in _TOKEN_RE.finditer(content))
+        found.update(match.group(1) for match in _BRACKET_TOKEN_RE.finditer(content))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +288,12 @@ def document_detail_ui(request, document_id: int):
         .filter(revision=document.template_revision)
         .order_by("display_order")
     )
+    layout_schema = document.template_revision.layout_schema if isinstance(document.template_revision.layout_schema, dict) else {}
+    layout_blocks = layout_schema.get("blocks") if isinstance(layout_schema.get("blocks"), list) else []
+    template_uses_body_block = any(
+        isinstance(block, dict) and str(block.get("type") or "").strip().lower() == "body"
+        for block in layout_blocks
+    )
 
     # Current field values keyed by placeholder name
     fields_map = {
@@ -265,12 +301,35 @@ def document_detail_ui(request, document_id: int):
         for f in document.fields.all()
     }
     fields_json = json.dumps(fields_map)
+    fields_rich_map = {
+        f.placeholder_name: f.value_json
+        for f in document.fields.all()
+        if f.placeholder_name == "body_text"
+    }
+    fields_rich_json = json.dumps(fields_rich_map)
     metadata = document.metadata if isinstance(document.metadata, dict) else {}
     template_tokens_map = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
     template_tokens_json = json.dumps(template_tokens_map)
     inherited_tokens_map, inherited_sources_map = resolve_registry_template_tokens(document)
     inherited_tokens_json = json.dumps(inherited_tokens_map)
     inherited_token_sources_json = json.dumps(inherited_sources_map)
+
+    layout_tokens = _extract_layout_tokens(layout_schema)
+    placeholder_names = {str(p.name or "").strip() for p in placeholders}
+    editable_layout_tokens = sorted(
+        token for token in layout_tokens
+        if token and token not in placeholder_names and token not in _RESERVED_RENDER_TOKENS
+    )
+    table_keys = sorted(set(editable_layout_tokens) | set(template_tokens_map.keys()))
+    token_table_rows = [
+        {
+            "key": key,
+            "value": str(template_tokens_map.get(key, "") or ""),
+            "used_in_layout": key in editable_layout_tokens,
+        }
+        for key in table_keys
+    ]
+    token_table_rows_json = json.dumps(token_table_rows)
 
     # Workflow stages
     workflow_stages = list(
@@ -358,8 +417,11 @@ def document_detail_ui(request, document_id: int):
     return render(request, "docgen/document_detail.html", {
         "document": document,
         "placeholders": placeholders,
+        "template_uses_body_block": template_uses_body_block,
         "fields_json": fields_json,
+        "fields_rich_json": fields_rich_json,
         "template_tokens_json": template_tokens_json,
+        "token_table_rows_json": token_table_rows_json,
         "inherited_tokens_json": inherited_tokens_json,
         "inherited_token_sources_json": inherited_token_sources_json,
         "workflow_stages": wf_data,

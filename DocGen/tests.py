@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from .adapters import CompassActorResolutionAdapter
 from .notifications import HttpNotificationAdapter
-from .services import process_sla_events
+from .services import process_sla_events, sanitize_rich_text_html
 from .models import (
 	Document,
 	DocumentAttachment,
@@ -25,6 +25,7 @@ from .models import (
 	Template,
 	TemplateCategory,
 	TemplateRevision,
+	TemplateTokenDefinition,
 	TemplateWorkflowStage,
 )
 
@@ -119,6 +120,14 @@ class DocGenViewTests(TestCase):
 	def test_verify_endpoint_returns_not_found_for_unknown_token(self):
 		response = self.client.get(reverse("docgen:verify-token", kwargs={"token": "not-found"}))
 		self.assertEqual(response.status_code, 404)
+
+	def test_rich_text_sanitizer_removes_disallowed_tags(self):
+		raw = "<p>Hello <strong>World</strong></p><script>alert(1)</script><img src='x' onerror='x'>"
+		sanitized = sanitize_rich_text_html(raw)
+
+		self.assertIn("<p>Hello <strong>World</strong></p>", sanitized)
+		self.assertNotIn("<script", sanitized)
+		self.assertNotIn("<img", sanitized)
 
 	def test_verify_endpoint_returns_revoked_status(self):
 		token = DocumentQRToken.objects.create(
@@ -434,6 +443,64 @@ class DocumentApiTests(TestCase):
 		self.assertEqual(response.status_code, 200)
 		document.refresh_from_db()
 		self.assertEqual(document.fields.count(), 1)
+
+	def test_set_body_text_field_sanitizes_html_and_keeps_delta(self):
+		document = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Body Field Document",
+		)
+		payload = {
+			"fields": [
+				{
+					"placeholder_name": "body_text",
+					"value_text": "<p>Intro <strong>text</strong></p><script>alert(1)</script>",
+					"value_json": {"ops": [{"insert": "Intro text\n"}]},
+				}
+			]
+		}
+		response = self.client.post(
+			reverse("docgen:document-set-fields", kwargs={"document_id": document.id}),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+
+		stored = document.fields.get(placeholder_name="body_text")
+		self.assertIn("<strong>text</strong>", stored.value_text)
+		self.assertNotIn("<script", stored.value_text)
+		self.assertEqual(stored.value_json, {"ops": [{"insert": "Intro text\n"}]})
+
+	def test_set_template_tokens_allows_unknown_layout_keys(self):
+		document = Document.objects.create(
+			template_revision=self.revision,
+			document_type=DocumentType.MEMORANDUM,
+			title="Unknown Token Document",
+		)
+		# Keep at least one registry key present to ensure mixed payload path is covered.
+		TemplateTokenDefinition.objects.create(
+			key="department",
+			label="Department",
+			description="Department name",
+			allow_document_override=True,
+		)
+		payload = {
+			"fields": [],
+			"template_tokens": {
+				"City": "Islamabad",
+				"department": "Admin Wing",
+			},
+		}
+		response = self.client.post(
+			reverse("docgen:document-set-fields", kwargs={"document_id": document.id}),
+			data=json.dumps(payload),
+			content_type="application/json",
+		)
+		self.assertEqual(response.status_code, 200)
+		document.refresh_from_db()
+		tokens = (document.metadata or {}).get("template_tokens", {})
+		self.assertEqual(tokens.get("City"), "Islamabad")
+		self.assertEqual(tokens.get("department"), "Admin Wing")
 
 	def test_submit_document_via_api_assigns_reference_and_workflow(self):
 		document = Document.objects.create(
