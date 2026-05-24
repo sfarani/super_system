@@ -4,9 +4,11 @@ import base64
 from io import BytesIO
 import hashlib
 import json
+from pathlib import Path
 import re
 
 from django.conf import settings
+from django.contrib.staticfiles import finders
 from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -196,17 +198,30 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
     if not isinstance(blocks, list) or not blocks:
         return ""
 
-    parts: list[str] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        block_type = str(block.get("type") or "custom")
-        align = str(block.get("align") or "left")
-        content = _render_template_tokens(str(block.get("content") or ""), render_context)
-        content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+    page = layout.get("page") if isinstance(layout, dict) else {}
+    if not isinstance(page, dict):
+        page = {}
 
+    def _resolve_logo_src(raw_url: str) -> str:
+        value = _render_template_tokens(str(raw_url or ""), render_context).strip()
+        if not value or "{{" in value or "}}" in value:
+            return ""
+        if value.startswith("/static/"):
+            rel_path = value[len("/static/"):]
+            found_path = finders.find(rel_path)
+            if found_path:
+                return Path(found_path).resolve().as_uri()
+            local_path = Path(settings.BASE_DIR) / value.lstrip("/")
+            if local_path.exists():
+                return local_path.resolve().as_uri()
+        return value
+
+    left_logo_src = _resolve_logo_src(page.get("logo_left_url") or "/static/DocGen/pnra_logo.png")
+    right_logo_src = _resolve_logo_src(page.get("logo_right_url") or "")
+
+    def _block_style(block_type: str, align: str, split_mode: bool = False) -> str:
         style = "margin-bottom:10px;white-space:normal;"
-        if align in {"left", "center", "right"}:
+        if not split_mode and align in {"left", "center", "right"}:
             style += f"text-align:{align};"
         if block_type == "letterhead":
             style += "font-weight:700;font-size:13pt;line-height:1.35;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:16px;"
@@ -217,13 +232,62 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
         elif block_type == "salutation":
             style += "margin-top:8px;margin-bottom:10px;"
         elif block_type == "body":
-            style += "line-height:1.65;text-align:justify;margin-bottom:12px;"
+            style += "line-height:1.65;"
+            if not split_mode:
+                style += "text-align:justify;"
+        elif block_type == "contacts_block":
+            style += "font-size:10pt;white-space:nowrap;"
         elif block_type == "closing":
             style += "margin-top:14px;margin-bottom:8px;"
         elif block_type == "signature_block":
             style += "margin-top:26px;line-height:1.4;"
         elif block_type == "footer":
             style += "font-size:9pt;color:#555;border-top:1px solid #ccc;padding-top:6px;margin-top:20px;"
+        return style
+
+    parts: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "custom")
+        align = str(block.get("align") or "left")
+        content = _render_template_tokens(str(block.get("content") or ""), render_context)
+
+        if block_type == "letterhead":
+            content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+            left_img_html = f"<img src='{escape(left_logo_src)}' style='height:48px;' />" if left_logo_src else ""
+            right_img_html = f"<img src='{escape(right_logo_src)}' style='height:48px;' />" if right_logo_src else ""
+            logos_html = (
+                "<table style='width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:8px;'>"
+                "<tr>"
+                f"<td style='width:50%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
+                f"<td style='width:50%;text-align:right;vertical-align:top;'>{right_img_html}</td>"
+                "</tr>"
+                "</table>"
+            )
+            style = _block_style(block_type, align, split_mode=False)
+            parts.append(f"<div style='{style}'>{logos_html}{content_html}</div>")
+            continue
+
+        if "||" in content:
+            left_raw, right_raw = content.split("||", 1)
+            left_html = escape(left_raw.strip()).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+            right_html = escape(right_raw.strip()).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+            style = _block_style(block_type, align, split_mode=True)
+            parts.append(
+                f"<div style='{style}'>"
+                "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+                "<tr>"
+                f"<td style='width:50%;text-align:left;vertical-align:top;'>{left_html}</td>"
+                f"<td style='width:50%;text-align:right;vertical-align:top;'>{right_html}</td>"
+                "</tr>"
+                "</table>"
+                "</div>"
+            )
+            continue
+
+        content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+        style = _block_style(block_type, align, split_mode=False)
 
         parts.append(f"<div style='{style}'>{content_html}</div>")
 

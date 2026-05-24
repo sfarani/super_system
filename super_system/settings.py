@@ -149,3 +149,8 @@ DOCGEN_NOTIFICATION_ADAPTER = 'DocGen.notifications.LocalNotificationAdapter'
 DOCGEN_NOTIFICATION_HTTP_ENDPOINT = ''
 DOCGEN_NOTIFICATION_TIMEOUT_SECONDS = 3.0
 DOCGEN_NOTIFICATION_API_TOKEN = ''
+
+# Auth redirect configuration: DocGen UI views use login_required.
+# Point to an existing login page to avoid 404 on /accounts/login/.
+LOGIN_URL = '/admin/login/'
+LOGIN_REDIRECT_URL = '/compass/docgen/ui/dashboard/'

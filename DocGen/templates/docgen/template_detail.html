@@ -83,14 +83,19 @@
   builderError: '',
   builderSuccess: '',
   builderPreviewOpen: false,
-  pageSetup: { paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25 },
+  pageSetup: {
+    paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25,
+    logo_left_url: '/static/DocGen/pnra_logo.png', logo_right_url: ''
+  },
   blocks: [],
   BLOCK_TYPES: [
     { type: 'letterhead',      label: 'Letterhead',    hint: 'Org name, address, branding' },
     { type: 'reference_line',  label: 'Reference Line', hint: 'Ref no. and date' },
+    { type: 'reference_contacts_combined', label: 'Reference + Contacts', hint: 'Contacts left, reference right' },
     { type: 'subject_line',    label: 'Subject',        hint: 'Subject heading' },
     { type: 'salutation',      label: 'Salutation',     hint: 'Opening greeting' },
     { type: 'body',            label: 'Body',           hint: 'Main body paragraph' },
+    { type: 'contacts_block',  label: 'Contacts Block', hint: 'Tel, Fax, Email on one line' },
     { type: 'closing',         label: 'Closing',        hint: 'Closing paragraph' },
     { type: 'signature_block', label: 'Signature',      hint: 'Signatory block' },
     { type: 'footer',          label: 'Footer',         hint: 'Page footer text' },
@@ -99,9 +104,11 @@
   DEFAULT_CONTENT: {
     letterhead:      'GOVERNMENT OF PAKISTAN\n[Ministry / Department Name]\n[City]',
     reference_line:  'No. [reference_number]\nDated: [date]',
+    reference_contacts_combined: 'Tel: {{tel}} | Fax: {{fax}} | Email: {{email}} || No. {{reference_number}} | Dated: {{date}}',
     subject_line:    'Subject: [subject]',
     salutation:      'Dear [recipient],',
     body:            '[body_text]',
+    contacts_block:  'Tel: {{tel}} | Fax: {{fax}} | Email: {{email}}',
     closing:         'Yours sincerely,',
     signature_block: '[signatory_name]\n[signatory_designation]\nDate: [approval_date]',
     footer:          '[reference_number] | COMPASS eOffice',
@@ -121,7 +128,10 @@
       const data = await resp.json();
       const schema = data.layout_schema || {};
       this.pageSetup = Object.assign(
-        { paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25 },
+        {
+          paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25,
+          logo_left_url: '/static/DocGen/pnra_logo.png', logo_right_url: ''
+        },
         schema.page || {}
       );
       this.blocks = (schema.blocks || []).map(b => ({ ...b }));
@@ -176,6 +186,38 @@
   blockTypeLabel(type) {
     const found = this.BLOCK_TYPES.find(t => t.type === type);
     return found ? found.label : type;
+  },
+  previewSegmentHtml(text) {
+    return String(text || '')
+      .trim()
+      .replace(/\n/g, '<br>')
+      .replace(/\{\{(\w+)\}\}/g, '<mark style=\'background:#fef9c3;padding:0 2px;border-radius:2px;\'>$1</mark>');
+  },
+  renderPreviewBlockHtml(block) {
+    const raw = String((block && block.content) || '');
+    if (block && block.type === 'letterhead') {
+      const leftLogo = String(this.pageSetup.logo_left_url || '/static/DocGen/pnra_logo.png').trim();
+      const rightLogo = String(this.pageSetup.logo_right_url || '').trim();
+      const textHtml = this.previewSegmentHtml(raw);
+      const leftLogoHtml = leftLogo
+        ? '<img src=\'' + leftLogo + '\' alt=\'PNRA logo\' style=\'max-height:48px;max-width:140px;object-fit:contain;\' />'
+        : '<div style=\'font-size:10px;color:#64748b;\'>PNRA Logo</div>';
+      const rightLogoHtml = rightLogo
+        ? '<img src=\'' + rightLogo + '\' alt=\'Department logo\' style=\'max-height:48px;max-width:140px;object-fit:contain;\' />'
+        : '';
+      return '<div><div style=\'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;\'>'
+        + '<div style=\'text-align:left;\'>' + leftLogoHtml + '</div>'
+        + '<div style=\'text-align:right;\'>' + rightLogoHtml + '</div>'
+        + '</div><div>' + textHtml + '</div></div>';
+    }
+    if (raw.includes('||')) {
+      const parts = raw.split('||');
+      const left = this.previewSegmentHtml(parts[0] || '');
+      const right = this.previewSegmentHtml(parts.slice(1).join('||') || '');
+      return '<div style=\'display:flex;justify-content:space-between;align-items:flex-start;gap:16px;\'><div style=\'text-align:left;\'>'
+        + left + '</div><div style=\'text-align:right;\'>' + right + '</div></div>';
+    }
+    return this.previewSegmentHtml(raw);
   },
 }">
 
@@ -423,6 +465,18 @@
             <input type="number" x-model.number="pageSetup.margin_right" @input="builderDirty = true" min="0" max="80"
                    class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
           </div>
+          <div class="min-w-[16rem]">
+            <label class="block text-xs text-slate-500 mb-1">PNRA Logo URL (Left)</label>
+            <input type="text" x-model="pageSetup.logo_left_url" @input="builderDirty = true"
+                   placeholder="/static/DocGen/pnra_logo.png"
+                   class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
+          <div class="min-w-[16rem]">
+            <label class="block text-xs text-slate-500 mb-1">Department Logo URL (Right, optional)</label>
+            <input type="text" x-model="pageSetup.logo_right_url" @input="builderDirty = true"
+                   placeholder="https://... or /static/..."
+                   class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+          </div>
         </div>
       </div>
 
@@ -523,7 +577,7 @@
                     </div>
                   </div>
                   <textarea x-model="block.content" @input="builderDirty = true" rows="4"
-                            placeholder="Block content. Use {{field_name}} tokens for placeholder values."
+                            placeholder="Block content. Use {{field_name}} tokens for values. Use left || right for one-line split alignment."
                             class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono bg-slate-50 focus:bg-white focus:ring-2 focus:ring-compass-500 outline-none resize-y text-slate-700 leading-relaxed"></textarea>
                 </div>
               </template>
@@ -559,12 +613,11 @@
                        'text-right':  block.align === 'right',
                        'font-bold text-lg border-b-2 border-slate-800 pb-2 mb-3': block.type === 'letterhead',
                        'font-semibold underline': block.type === 'subject_line',
+                       'text-sm whitespace-nowrap': block.type === 'contacts_block',
                        'mt-6 pt-3 border-t border-slate-400': block.type === 'signature_block',
                        'text-xs text-slate-500 border-t border-slate-200 pt-1': block.type === 'footer'
                      }"
-                     x-html="block.content
-                       .replace(/\n/g, '<br>')
-                       .replace(/\{\{(\w+)\}\}/g, '<mark style=\'background:#fef9c3;padding:0 2px;border-radius:2px;\'>$1</mark>')">
+                     x-html="renderPreviewBlockHtml(block)">
                 </div>
               </template>
               <div x-show="blocks.length === 0" class="text-center text-slate-300 py-10 text-sm italic">
