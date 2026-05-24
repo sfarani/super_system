@@ -10,6 +10,7 @@ import csv
 import json
 from io import StringIO
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db.models import Count, Q, Prefetch
@@ -53,6 +54,34 @@ def _status_choices():
 
 def _type_choices():
     return [t.value for t in DocumentType]
+
+
+def _optional_logo_options() -> list[dict[str, str]]:
+    """Return configured right-side letterhead logos for the builder dropdown."""
+    raw = getattr(settings, "DOCGEN_OPTIONAL_LOGOS", {})
+    options: list[dict[str, str]] = [{"key": "", "label": "None", "url": ""}]
+
+    if not isinstance(raw, dict):
+        return options
+
+    for key, entry in raw.items():
+        key_str = str(key or "").strip()
+        if not key_str:
+            continue
+
+        if isinstance(entry, dict):
+            label = str(entry.get("label") or key_str).strip()
+            url = str(entry.get("url") or "").strip()
+        else:
+            label = key_str
+            url = str(entry or "").strip()
+
+        if not url:
+            continue
+
+        options.append({"key": key_str, "label": label, "url": url})
+
+    return options
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +799,7 @@ def template_detail(request, template_id: int):
             "revisions": revisions,
             "field_type_choices": [ft.value for ft in PlaceholderType],
             "action_choices": [a.value for a in WorkflowActionType],
+            "optional_logo_options": _optional_logo_options(),
         })
 
     placeholders = list(
@@ -791,6 +821,7 @@ def template_detail(request, template_id: int):
         "revisions": revisions,
         "field_type_choices": [ft.value for ft in PlaceholderType],
         "action_choices": [a.value for a in WorkflowActionType],
+        "optional_logo_options": _optional_logo_options(),
     })
 
 

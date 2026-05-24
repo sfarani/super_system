@@ -83,9 +83,14 @@
   builderError: '',
   builderSuccess: '',
   builderPreviewOpen: false,
+  optionalLogos: [
+    {% for opt in optional_logo_options %}
+    { key: '{{ opt.key|escapejs }}', label: '{{ opt.label|escapejs }}', url: '{{ opt.url|escapejs }}' },
+    {% endfor %}
+  ],
   pageSetup: {
     paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25,
-    logo_left_url: '/static/DocGen/pnra_logo.png', logo_right_url: ''
+    logo_right_key: '', logo_right_url: ''
   },
   blocks: [],
   BLOCK_TYPES: [
@@ -102,7 +107,7 @@
     { type: 'custom',          label: 'Custom Block',   hint: 'Freeform content' },
   ],
   DEFAULT_CONTENT: {
-    letterhead:      'GOVERNMENT OF PAKISTAN\n[Ministry / Department Name]\n[City]',
+    letterhead:      'Pakistan Nuclear Regulatory Authority\n[Department Name]\n[City]',
     reference_line:  'No. [reference_number]\nDated: [date]',
     reference_contacts_combined: 'Tel: {{tel}} | Fax: {{fax}} | Email: {{email}} || No. {{reference_number}} | Dated: {{date}}',
     subject_line:    'Subject: [subject]',
@@ -130,10 +135,17 @@
       this.pageSetup = Object.assign(
         {
           paper_size: 'A4', orientation: 'portrait', margin_top: 20, margin_bottom: 20, margin_left: 25, margin_right: 25,
-          logo_left_url: '/static/DocGen/pnra_logo.png', logo_right_url: ''
+          logo_right_key: '', logo_right_url: ''
         },
         schema.page || {}
       );
+
+      // Backward compatibility: map legacy saved URL to current dropdown key where possible.
+      if (!this.pageSetup.logo_right_key && this.pageSetup.logo_right_url) {
+        const legacy = String(this.pageSetup.logo_right_url).trim();
+        const found = this.optionalLogos.find(o => o.url === legacy);
+        if (found) this.pageSetup.logo_right_key = found.key;
+      }
       this.blocks = (schema.blocks || []).map(b => ({ ...b }));
     }
     this.builderLoading = false;
@@ -142,7 +154,10 @@
   async saveLayout() {
     if (!this.layoutUrl) return;
     this.builderSaving = true; this.builderError = ''; this.builderSuccess = '';
-    const schema = { page: { ...this.pageSetup }, blocks: this.blocks.map(b => ({ ...b })) };
+    const page = { ...this.pageSetup };
+    delete page.logo_left_url;
+    delete page.logo_right_url;
+    const schema = { page, blocks: this.blocks.map(b => ({ ...b })) };
     const resp = await fetch(this.layoutUrl, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
@@ -187,6 +202,12 @@
     const found = this.BLOCK_TYPES.find(t => t.type === type);
     return found ? found.label : type;
   },
+  selectedRightLogoUrl() {
+    const key = String(this.pageSetup.logo_right_key || '').trim();
+    if (!key) return '';
+    const found = this.optionalLogos.find(o => o.key === key);
+    return found ? found.url : '';
+  },
   previewSegmentHtml(text) {
     return String(text || '')
       .trim()
@@ -196,19 +217,26 @@
   renderPreviewBlockHtml(block) {
     const raw = String((block && block.content) || '');
     if (block && block.type === 'letterhead') {
-      const leftLogo = String(this.pageSetup.logo_left_url || '/static/DocGen/pnra_logo.png').trim();
-      const rightLogo = String(this.pageSetup.logo_right_url || '').trim();
+      const leftLogo = '/static/DocGen/pnra_logo.png';
+      const rightLogo = String(this.selectedRightLogoUrl() || '').trim();
       const textHtml = this.previewSegmentHtml(raw);
       const leftLogoHtml = leftLogo
-        ? '<img src=\'' + leftLogo + '\' alt=\'PNRA logo\' style=\'max-height:48px;max-width:140px;object-fit:contain;\' />'
+        ? '<img src=\'' + leftLogo + '\' alt=\'PNRA logo\' style=\'display:inline-block;max-height:48px;max-width:140px;object-fit:contain;\' />'
         : '<div style=\'font-size:10px;color:#64748b;\'>PNRA Logo</div>';
       const rightLogoHtml = rightLogo
-        ? '<img src=\'' + rightLogo + '\' alt=\'Department logo\' style=\'max-height:48px;max-width:140px;object-fit:contain;\' />'
+        ? '<img src=\'' + rightLogo + '\' alt=\'Department logo\' style=\'display:inline-block;max-height:48px;max-width:140px;object-fit:contain;\' />'
         : '';
-      return '<div><div style=\'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;\'>'
-        + '<div style=\'text-align:left;\'>' + leftLogoHtml + '</div>'
-        + '<div style=\'text-align:right;\'>' + rightLogoHtml + '</div>'
-        + '</div><div>' + textHtml + '</div></div>';
+      if (rightLogoHtml) {
+        return '<div style=\'display:flex;align-items:flex-start;gap:12px;width:100%;\'>'
+          + '<div style=\'width:20%;text-align:left;\'>' + leftLogoHtml + '</div>'
+          + '<div style=\'width:60%;text-align:center;\'>' + textHtml + '</div>'
+          + '<div style=\'width:20%;text-align:right;\'>' + rightLogoHtml + '</div>'
+          + '</div>';
+      }
+      return '<div style=\'display:flex;align-items:flex-start;gap:12px;width:100%;\'>'
+        + '<div style=\'width:20%;text-align:left;\'>' + leftLogoHtml + '</div>'
+        + '<div style=\'width:80%;text-align:center;\'>' + textHtml + '</div>'
+        + '</div>';
     }
     if (raw.includes('||')) {
       const parts = raw.split('||');
@@ -466,16 +494,19 @@
                    class="w-20 border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
           </div>
           <div class="min-w-[16rem]">
-            <label class="block text-xs text-slate-500 mb-1">PNRA Logo URL (Left)</label>
-            <input type="text" x-model="pageSetup.logo_left_url" @input="builderDirty = true"
-                   placeholder="/static/DocGen/pnra_logo.png"
-                   class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            <label class="block text-xs text-slate-500 mb-1">PNRA Logo (Left)</label>
+            <input type="text" value="/static/DocGen/pnra_logo.png" readonly
+                   class="w-full border border-slate-200 bg-slate-50 text-slate-500 rounded-lg px-3 py-1.5 text-sm outline-none" />
           </div>
           <div class="min-w-[16rem]">
-            <label class="block text-xs text-slate-500 mb-1">Department Logo URL (Right, optional)</label>
-            <input type="text" x-model="pageSetup.logo_right_url" @input="builderDirty = true"
-                   placeholder="https://... or /static/..."
-                   class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-compass-500 outline-none" />
+            <label class="block text-xs text-slate-500 mb-1">Department Logo (Right, optional)</label>
+            <select x-model="pageSetup.logo_right_key" @change="builderDirty = true"
+                    class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:ring-2 focus:ring-compass-500 outline-none">
+              <template x-for="opt in optionalLogos" :key="opt.key || 'none'">
+                <option :value="opt.key" x-text="opt.label"></option>
+              </template>
+            </select>
+            <p class="text-[11px] text-slate-400 mt-1">Configure available options in settings: DOCGEN_OPTIONAL_LOGOS</p>
           </div>
         </div>
       </div>

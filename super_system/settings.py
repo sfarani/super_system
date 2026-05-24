@@ -154,3 +154,16 @@ DOCGEN_NOTIFICATION_API_TOKEN = ''
 # Point to an existing login page to avoid 404 on /accounts/login/.
 LOGIN_URL = '/admin/login/'
 LOGIN_REDIRECT_URL = '/compass/docgen/ui/dashboard/'
+
+# Optional right-side letterhead logos for specific offices/departments.
+# Add static files under DocGen/static/DocGen/ and reference with /static/DocGen/<file>.
+DOCGEN_OPTIONAL_LOGOS = {
+    'nisas': {
+        'label': 'NISAS',
+        'url': '/static/DocGen/nisas_logo.png',
+    },
+    'emd_labs': {
+        'label': 'EM&D Labs',
+        'url': '/static/DocGen/emd_labs_logo.png',
+    },
+}

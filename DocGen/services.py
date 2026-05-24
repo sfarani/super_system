@@ -216,8 +216,24 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
                 return local_path.resolve().as_uri()
         return value
 
-    left_logo_src = _resolve_logo_src(page.get("logo_left_url") or "/static/DocGen/pnra_logo.png")
-    right_logo_src = _resolve_logo_src(page.get("logo_right_url") or "")
+    left_logo_src = _resolve_logo_src("/static/DocGen/pnra_logo.png")
+
+    raw_optional = getattr(settings, "DOCGEN_OPTIONAL_LOGOS", {})
+    selected_right_logo_url = ""
+    selected_key = str(page.get("logo_right_key") or "").strip()
+
+    if selected_key and isinstance(raw_optional, dict):
+        entry = raw_optional.get(selected_key)
+        if isinstance(entry, dict):
+            selected_right_logo_url = str(entry.get("url") or "").strip()
+        elif entry is not None:
+            selected_right_logo_url = str(entry).strip()
+
+    # Backward compatibility for already-saved layouts.
+    if not selected_right_logo_url:
+        selected_right_logo_url = str(page.get("logo_right_url") or "").strip()
+
+    right_logo_src = _resolve_logo_src(selected_right_logo_url)
 
     def _block_style(block_type: str, align: str, split_mode: bool = False) -> str:
         style = "margin-bottom:10px;white-space:normal;"
@@ -255,18 +271,37 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
 
         if block_type == "letterhead":
             content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-            left_img_html = f"<img src='{escape(left_logo_src)}' style='height:48px;' />" if left_logo_src else ""
-            right_img_html = f"<img src='{escape(right_logo_src)}' style='height:48px;' />" if right_logo_src else ""
-            logos_html = (
-                "<table style='width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:8px;'>"
-                "<tr>"
-                f"<td style='width:50%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
-                f"<td style='width:50%;text-align:right;vertical-align:top;'>{right_img_html}</td>"
-                "</tr>"
-                "</table>"
+            left_img_html = (
+                f"<img src='{escape(left_logo_src)}' style='height:48px;max-width:140px;' />"
+                if left_logo_src
+                else ""
             )
+            right_img_html = (
+                f"<img src='{escape(right_logo_src)}' style='height:48px;max-width:140px;' />"
+                if right_logo_src
+                else ""
+            )
+            if right_img_html:
+                row_html = (
+                    "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+                    "<tr>"
+                    f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
+                    f"<td style='width:60%;text-align:center;vertical-align:top;'>{content_html}</td>"
+                    f"<td style='width:20%;text-align:right;vertical-align:top;'>{right_img_html}</td>"
+                    "</tr>"
+                    "</table>"
+                )
+            else:
+                row_html = (
+                    "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+                    "<tr>"
+                    f"<td style='width:20%;text-align:left;vertical-align:top;'>{left_img_html}</td>"
+                    f"<td style='width:80%;text-align:center;vertical-align:top;'>{content_html}</td>"
+                    "</tr>"
+                    "</table>"
+                )
             style = _block_style(block_type, align, split_mode=False)
-            parts.append(f"<div style='{style}'>{logos_html}{content_html}</div>")
+            parts.append(f"<div style='{style}'>{row_html}</div>")
             continue
 
         if "||" in content:
