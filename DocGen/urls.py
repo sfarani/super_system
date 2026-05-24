@@ -65,6 +65,10 @@ urlpatterns = [
     path("reports/sla/", views.report_sla, name="report-sla"),
     path("reports/pending/", views.report_pending, name="report-pending"),
 
+    # Dashboard widgets
+    path("widgets/pending-approvals/", views.widget_pending_approvals, name="widget-pending-approvals"),
+    path("widgets/recent-documents/", views.widget_recent_documents, name="widget-recent-documents"),
+
     # -----------------------------------------------------------------------
     # UI (server-rendered HTML pages)
     # -----------------------------------------------------------------------

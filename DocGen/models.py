@@ -252,6 +252,7 @@ class Template(TimeStampedModel):
 			("template_author", "Can author DocGen templates"),
 			("template_publisher", "Can publish and retire DocGen templates"),
 			("admin", "Can administer DocGen operations"),
+			("viewer", "Can view finalized DocGen documents"),
 		]
 
 	def __str__(self):
@@ -412,6 +413,9 @@ class TemplateWorkflowStage(TimeStampedModel):
 	)
 	sla_hours = models.PositiveIntegerField(default=48)
 	is_mandatory = models.BooleanField(default=True)
+	# M2: Optional branch condition evaluated when choosing the next stage after this one.
+	# Schema: {"field": "<placeholder_name>", "operator": "eq|neq|in|nin", "value": <any>}
+	branch_condition = models.JSONField(null=True, blank=True)
 
 	class Meta:
 		ordering = ["stage_order", "id"]
@@ -424,6 +428,31 @@ class TemplateWorkflowStage(TimeStampedModel):
 
 	def __str__(self):
 		return f"{self.revision} stage {self.stage_order}: {self.title}"
+
+
+class TemplateAssetType(models.TextChoices):
+	LOGO = "LOGO", "Logo"
+	WATERMARK = "WATERMARK", "Watermark"
+	LETTERHEAD = "LETTERHEAD", "Letterhead"
+
+
+class TemplateAsset(TimeStampedModel):
+	"""Images (logos, watermarks, letterheads) attached to a template revision."""
+	revision = models.ForeignKey(
+		TemplateRevision,
+		on_delete=models.CASCADE,
+		related_name="assets",
+	)
+	asset_type = models.CharField(max_length=20, choices=TemplateAssetType.choices)
+	file = models.FileField(upload_to="docgen/template_assets/")
+	label = models.CharField(max_length=180, blank=True)
+	is_active = models.BooleanField(default=True)
+
+	class Meta:
+		ordering = ["asset_type", "label"]
+
+	def __str__(self):
+		return f"{self.revision} — {self.asset_type}: {self.label or self.file.name}"
 
 
 class ReferenceNumberSequence(models.Model):
@@ -516,9 +545,13 @@ class Document(TimeStampedModel):
 		}
 		return code_map.get(str(document_type), "DOC")
 
-	def assign_reference_number(self, org_code: str = "HQ") -> str:
+	def assign_reference_number(self, org_code: str = "") -> str:
 		if self.reference_number:
 			return self.reference_number
+
+		if not org_code:
+			from django.conf import settings as _settings
+			org_code = str(getattr(_settings, "DOCGEN_ORG_CODE", "HQ")).strip() or "HQ"
 
 		year = timezone.now().year
 		type_code = self.get_type_code(self.document_type)
@@ -667,6 +700,13 @@ class DocumentPDF(TimeStampedModel):
 
 class RetentionPolicy(TimeStampedModel):
 	name = models.CharField(max_length=80, unique=True, default="default")
+	document_type = models.CharField(
+		max_length=30,
+		choices=DocumentType.choices,
+		null=True,
+		blank=True,
+		help_text="If set, this policy applies only to the specified document type. Leave blank for a global policy.",
+	)
 	archive_retention_days = models.PositiveIntegerField(
 		default=365,
 		validators=[MinValueValidator(1)],
@@ -677,14 +717,20 @@ class RetentionPolicy(TimeStampedModel):
 		ordering = ["-is_active", "name"]
 
 	def __str__(self):
-		return f"{self.name} ({self.archive_retention_days} days)"
+		type_label = f" [{self.document_type}]" if self.document_type else " [global]"
+		return f"{self.name}{type_label} ({self.archive_retention_days} days)"
 
 	@classmethod
-	def get_active_days(cls) -> int | None:
-		active = cls.objects.filter(is_active=True).order_by("id").first()
-		if active is None:
+	def get_active_days(cls, document_type: str = "") -> int | None:
+		"""Return retention days. Looks up doc-type-specific policy first, then global."""
+		if document_type:
+			specific = cls.objects.filter(is_active=True, document_type=document_type).order_by("id").first()
+			if specific is not None:
+				return specific.archive_retention_days
+		global_policy = cls.objects.filter(is_active=True, document_type__isnull=True).order_by("id").first()
+		if global_policy is None:
 			return None
-		return active.archive_retention_days
+		return global_policy.archive_retention_days
 
 
 class DocumentComment(TimeStampedModel):

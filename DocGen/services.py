@@ -179,6 +179,12 @@ def _build_render_context(document: Document, field_map: dict[str, str]) -> dict
     custom_tokens = metadata.get("template_tokens") if isinstance(metadata.get("template_tokens"), dict) else {}
     registry_tokens, _ = resolve_registry_template_tokens(document)
 
+    originator_username = document.originator.username if document.originator else ""
+    originator_full_name = (
+        document.originator.get_full_name() or originator_username
+        if document.originator
+        else ""
+    )
     context = {
         "reference_number": document.reference_number or "",
         "date": now_local.strftime("%d %b %Y"),
@@ -186,10 +192,49 @@ def _build_render_context(document: Document, field_map: dict[str, str]) -> dict
         "subject": document.subject or "",
         "document_type": str(document.document_type or ""),
         "status": str(document.status or ""),
-        "originator": document.originator.username if document.originator else "",
+        "originator": originator_username,
+        "originator_name": originator_full_name,
         "submitted_date": submitted_at,
         "approval_date": approved_at,
     }
+
+    # M1: Resolve SIGNATURE placeholders — inject approver name and date from the last APPROVE stage.
+    # This populates "signature_name", "signature_designation", and "signature_date" tokens that
+    # templates can reference as {{signature_name}}, {{signature_designation}}, etc.
+    signature_name = ""
+    signature_designation = ""
+    signature_date = ""
+    try:
+        last_approve_stage = (
+            document.workflow_stages
+            .filter(required_action__in=["APPROVE", "APPROVE_WITH_COMMENTS"], acted_at__isnull=False)
+            .order_by("-acted_at")
+            .first()
+        )
+        if last_approve_stage:
+            if last_approve_stage.actor_type == "USER":
+                from django.contrib.auth import get_user_model
+                _User = get_user_model()
+                try:
+                    actor_user = _User.objects.get(username=last_approve_stage.actor_value)
+                    signature_name = actor_user.get_full_name() or actor_user.username
+                    signature_designation = str(
+                        getattr(getattr(actor_user, "profile", None), "designation", "") or ""
+                    )
+                except _User.DoesNotExist:
+                    signature_name = last_approve_stage.actor_value
+            else:
+                stage_meta = last_approve_stage.metadata or {}
+                signature_name = str(stage_meta.get("actor_display_name") or last_approve_stage.actor_value or "")
+            if last_approve_stage.acted_at:
+                signature_date = timezone.localtime(last_approve_stage.acted_at).strftime("%d %b %Y")
+    except Exception:
+        pass
+
+    context["signature_name"] = signature_name
+    context["signature_designation"] = signature_designation
+    context["signature_date"] = signature_date
+
     context.update({str(k): "" if v is None else str(v) for k, v in registry_tokens.items() if str(k).strip()})
     context.update({str(k): "" if v is None else str(v) for k, v in custom_tokens.items() if str(k).strip()})
     context.update(field_map)
@@ -282,6 +327,26 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
         return value
 
     left_logo_src = _resolve_logo_src("/static/DocGen/pnra_logo.png")
+
+    # D6: Prefer TemplateAsset LOGO (active) over settings-based logos.
+    _template_asset_logo: str = ""
+    try:
+        from .models import TemplateAsset, TemplateAssetType  # local import to avoid circular
+        asset_qs = (
+            TemplateAsset.objects
+            .filter(revision=document.template_revision, asset_type=TemplateAssetType.LOGO, is_active=True)
+            .order_by("label")
+            .first()
+        )
+        if asset_qs and asset_qs.file:
+            try:
+                _template_asset_logo = asset_qs.file.path
+            except (ValueError, AttributeError):
+                pass
+    except Exception:
+        pass
+    if _template_asset_logo:
+        left_logo_src = Path(_template_asset_logo).resolve().as_uri()
 
     raw_optional = getattr(settings, "DOCGEN_OPTIONAL_LOGOS", {})
     selected_right_logo_url = ""
@@ -400,6 +465,57 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
             style += "color:#555;border-top:1px solid #ccc;padding-top:6px;margin-top:20px;"
         return style
 
+    def _render_table_content(raw_content: str) -> str:
+        """Render a JSON array (or array-of-arrays) as an HTML table."""
+        try:
+            data = json.loads(raw_content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return escape(raw_content)
+        if not isinstance(data, list) or not data:
+            return escape(raw_content)
+
+        rows_html: list[str] = []
+        header_row = data[0]
+        if isinstance(header_row, dict):
+            headers = list(header_row.keys())
+            header_cells = "".join(
+                f"<th style='border:1px solid #aaa;padding:4px 8px;background:#e8e8e8;font-weight:bold;'>{escape(str(h))}</th>"
+                for h in headers
+            )
+            rows_html.append(f"<tr>{header_cells}</tr>")
+            for row in data:
+                if isinstance(row, dict):
+                    cells = "".join(
+                        f"<td style='border:1px solid #aaa;padding:4px 8px;'>{escape(str(row.get(h, '')))}</td>"
+                        for h in headers
+                    )
+                    rows_html.append(f"<tr>{cells}</tr>")
+        elif isinstance(header_row, list):
+            # First row treated as headers.
+            header_cells = "".join(
+                f"<th style='border:1px solid #aaa;padding:4px 8px;background:#e8e8e8;font-weight:bold;'>{escape(str(h))}</th>"
+                for h in header_row
+            )
+            rows_html.append(f"<tr>{header_cells}</tr>")
+            for row in data[1:]:
+                cells = "".join(
+                    f"<td style='border:1px solid #aaa;padding:4px 8px;'>{escape(str(cell))}</td>"
+                    for cell in (row if isinstance(row, list) else [row])
+                )
+                rows_html.append(f"<tr>{cells}</tr>")
+        else:
+            # Flat list — single column.
+            for item in data:
+                rows_html.append(
+                    f"<tr><td style='border:1px solid #aaa;padding:4px 8px;'>{escape(str(item))}</td></tr>"
+                )
+
+        return (
+            "<table style='width:100%;border-collapse:collapse;margin-bottom:10px;'>"
+            + "".join(rows_html)
+            + "</table>"
+        )
+
     parts: list[str] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -409,6 +525,23 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
         font_key = str(block.get("font_family") or "helvetica")
         font_size = block.get("font_size")
         content = _render_template_tokens(str(block.get("content") or ""), render_context)
+
+        # D2: Evaluate conditional visibility — skip block if condition is not met.
+        conditional_cfg = block.get("conditional")
+        if isinstance(conditional_cfg, dict):
+            depends_on = str(conditional_cfg.get("depends_on_field") or "").strip()
+            show_if = str(conditional_cfg.get("show_if_value") or "").strip()
+            if depends_on:
+                actual_value = str(render_context.get(depends_on) or "").strip()
+                if actual_value != show_if:
+                    continue  # Condition false — skip this block entirely.
+
+        # D3: Render table-type blocks from JSON array content.
+        if block_type == "table":
+            table_html = _render_table_content(content)
+            style = _block_style(block_type, align, font_key, font_size, split_mode=False)
+            parts.append(f"<div style='{style}'>{table_html}</div>")
+            continue
 
         if block_type == "letterhead":
             content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
@@ -527,6 +660,127 @@ def _generate_qr_data_uri(data: str) -> str | None:
     return f"data:image/png;base64,{encoded}"
 
 
+def _build_qr_html(document: Document) -> str:
+    """Return the QR code HTML block for the document, or empty string if no token exists."""
+    try:
+        qr_token = document.qr_token  # OneToOne; raises RelatedObjectDoesNotExist if absent
+        verify_path = f"/compass/docgen/verify/{qr_token.token}/"
+        verify_url = getattr(settings, "DOCGEN_PUBLIC_BASE_URL", "").rstrip("/") + verify_path
+        qr_data_uri = _generate_qr_data_uri(verify_url)
+        if qr_data_uri:
+            return (
+                "<div style='margin-top:24px;text-align:center;'>"
+                f"<img src='{qr_data_uri}' width='100' height='100' />"
+                "<br/><span style='font-size:8pt;color:#555;'>"
+                f"Scan to verify: {escape(verify_url)}"
+                "</span></div>"
+            )
+        return f"<p style='font-size:9pt;color:#555;'>Verify: {escape(verify_url)}</p>"
+    except Exception:
+        return ""
+
+
+def _build_approval_trail_html(document: Document) -> str:
+    """Return an HTML block showing the completed workflow trail for the document."""
+    acted_stages = list(
+        document.workflow_stages
+        .exclude(acted_at=None)
+        .order_by("stage_order", "id")
+        .select_related("acted_by")
+    )
+    if not acted_stages:
+        return ""
+
+    rows = []
+    for stage in acted_stages:
+        actor_display = ""
+        if stage.acted_by:
+            full_name = stage.acted_by.get_full_name()
+            actor_display = full_name if full_name else stage.acted_by.username
+        acted_at_display = (
+            timezone.localtime(stage.acted_at).strftime("%d %b %Y %H:%M") if stage.acted_at else ""
+        )
+        rows.append(
+            "<tr>"
+            f"<td style='padding:4px 6px;border:1px solid #ccc;'>{escape(stage.title)}</td>"
+            f"<td style='padding:4px 6px;border:1px solid #ccc;'>{escape(actor_display)}</td>"
+            f"<td style='padding:4px 6px;border:1px solid #ccc;'>{escape(stage.required_action)}</td>"
+            f"<td style='padding:4px 6px;border:1px solid #ccc;'>{escape(stage.comments)}</td>"
+            f"<td style='padding:4px 6px;border:1px solid #ccc;'>{escape(acted_at_display)}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<div style='margin-top:24px;'>"
+        "<div style='font-weight:700;font-size:10pt;margin-bottom:6px;border-bottom:1px solid #555;padding-bottom:4px;'>"
+        "Approval Trail"
+        "</div>"
+        "<table style='width:100%;border-collapse:collapse;font-size:9pt;'>"
+        "<thead>"
+        "<tr style='background:#f3f3f3;'>"
+        "<th style='padding:4px 6px;border:1px solid #ccc;text-align:left;'>Stage</th>"
+        "<th style='padding:4px 6px;border:1px solid #ccc;text-align:left;'>Actor</th>"
+        "<th style='padding:4px 6px;border:1px solid #ccc;text-align:left;'>Action</th>"
+        "<th style='padding:4px 6px;border:1px solid #ccc;text-align:left;'>Comments</th>"
+        "<th style='padding:4px 6px;border:1px solid #ccc;text-align:left;'>Date</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        + "".join(rows)
+        + "</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+_CLASSIFICATION_WATERMARKS: dict[str, str] = {
+    "CONFIDENTIAL": "CONFIDENTIAL",
+    "confidential": "CONFIDENTIAL",
+    "RESTRICTED": "RESTRICTED",
+    "restricted": "RESTRICTED",
+    "SECRET": "SECRET",
+    "secret": "SECRET",
+    "FOR OFFICIAL USE ONLY": "FOR OFFICIAL USE ONLY",
+    "for official use only": "FOR OFFICIAL USE ONLY",
+    "FOUO": "FOR OFFICIAL USE ONLY",
+    "fouo": "FOR OFFICIAL USE ONLY",
+}
+
+
+def _build_classification_watermark_style(document: Document, is_draft: bool = False) -> str:
+    """Return a CSS <style> block with an appropriate watermark for the document.
+
+    Draft preview always shows 'DRAFT'. Finalized documents show a classification
+    watermark when classification is set to a recognized sensitive value.
+    """
+    if is_draft:
+        watermark_text = "DRAFT"
+        color = "rgba(200,0,0,0.12)"
+    else:
+        raw_classification = str(document.classification or "").strip()
+        watermark_text = _CLASSIFICATION_WATERMARKS.get(raw_classification, "")
+        if not watermark_text:
+            return ""
+        color = "rgba(0,0,180,0.08)"
+
+    escaped_text = watermark_text.replace("'", "\\'")
+    return (
+        "<style>"
+        "body::before {"
+        f"  content: '{escaped_text}';"
+        "  position: fixed;"
+        "  top: 40%;"
+        "  left: 5%;"
+        "  font-size: 60pt;"
+        "  color: " + color + ";"
+        "  transform: rotate(-35deg);"
+        "  z-index: -1;"
+        "  pointer-events: none;"
+        "}"
+        "</style>"
+    )
+
+
 def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> str:
     field_map = {
         field.placeholder_name: _coerce_text_value(field.value_text, field.value_json)
@@ -545,6 +799,10 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
         missing_required = _find_missing_required_placeholders(document, field_map)
         diagnostics_html = _build_preview_diagnostics_html(missing_required, unresolved_tokens)
 
+    approval_trail_html = _build_approval_trail_html(document)
+    qr_html = _build_qr_html(document)
+    classification_watermark = _build_classification_watermark_style(document, is_draft=include_diagnostics)
+
     if layout_body:
         return f"""
 <!DOCTYPE html>
@@ -555,10 +813,13 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
             @page {{ size: {escape(paper_size)} {escape(orientation)}; margin: {margin_top}mm {margin_right}mm {margin_bottom}mm {margin_left}mm; }}
             body {{ margin: 0; font-family: Helvetica, Arial, sans-serif; font-size: 11pt; color: #111; line-height: 1.5; }}
         </style>
+        {classification_watermark}
     </head>
     <body>
         {diagnostics_html}
         {layout_body}
+        {approval_trail_html}
+        {qr_html}
     </body>
 </html>
 """.strip()
@@ -595,26 +856,6 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
 
     finalized_at = document.finalized_at.isoformat() if document.finalized_at else ""
 
-    # QR code block — embed image if token exists and qrcode library is available
-    qr_html = ""
-    try:
-        qr_token = document.qr_token  # OneToOne; raises if absent
-        verify_path = f"/compass/docgen/verify/{qr_token.token}/"
-        verify_url = getattr(settings, "DOCGEN_PUBLIC_BASE_URL", "").rstrip("/") + verify_path
-        qr_data_uri = _generate_qr_data_uri(verify_url)
-        if qr_data_uri:
-            qr_html = (
-                "<div style='margin-top:24px;text-align:center;'>"
-                f"<img src='{qr_data_uri}' width='100' height='100' />"
-                "<br/><span style='font-size:8pt;color:#555;'>"
-                f"Scan to verify: {escape(verify_url)}"
-                "</span></div>"
-            )
-        else:
-            qr_html = f"<p class='small'>Verify: {escape(verify_url)}</p>"
-    except Exception:
-        pass
-
     return f"""
 <!DOCTYPE html>
 <html>
@@ -630,6 +871,7 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
             th {{ background: #f3f3f3; }}
             .small {{ color: #666; font-size: 9pt; }}
         </style>
+        {classification_watermark}
     </head>
     <body>
         <h1>{escape(document.title)}</h1>
@@ -654,6 +896,7 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
             {''.join(event_items) if event_items else '<li>No events recorded.</li>'}
         </ul>
 
+        {approval_trail_html}
         {qr_html}
 
         <p class=\"small\">Generated by DocGen on {escape(timezone.now().isoformat())}</p>
@@ -761,24 +1004,8 @@ def generate_pdf_preview(document: Document) -> bytes:
 
 
 def _build_pdf_preview_html(document: Document) -> str:
-    """Same as _build_pdf_html but injects a DRAFT watermark style."""
-    base = _build_pdf_html(document, include_diagnostics=True)
-    watermark_style = (
-        "<style>"
-        "body::before {"
-        "  content: 'DRAFT';"
-        "  position: fixed;"
-        "  top: 40%;"
-        "  left: 10%;"
-        "  font-size: 90pt;"
-        "  color: rgba(200,0,0,0.12);"
-        "  transform: rotate(-35deg);"
-        "  z-index: -1;"
-        "  pointer-events: none;"
-        "}"
-        "</style>"
-    )
-    return base.replace("</head>", watermark_style + "</head>", 1)
+    """Same as _build_pdf_html but passes include_diagnostics=True so the DRAFT watermark is applied."""
+    return _build_pdf_html(document, include_diagnostics=True)
 
 
 def _get_actor_resolution_adapter():

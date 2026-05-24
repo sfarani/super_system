@@ -54,6 +54,7 @@ _DOCGEN_ROLE_PERMISSIONS = {
 	"docgen.template_author": f"{_DOCGEN_PERMISSION_PREFIX}template_author",
 	"docgen.template_publisher": f"{_DOCGEN_PERMISSION_PREFIX}template_publisher",
 	"docgen.admin": f"{_DOCGEN_PERMISSION_PREFIX}admin",
+	"docgen.viewer": f"{_DOCGEN_PERMISSION_PREFIX}viewer",
 }
 
 
@@ -176,8 +177,8 @@ def _authorize_docgen_action(request, allowed_roles):
 	return JsonResponse({"error": "Forbidden by DocGen role policy."}, status=403)
 
 
-def _archive_retention_days() -> int:
-	policy_days = RetentionPolicy.get_active_days()
+def _archive_retention_days(document_type: str = "") -> int:
+	policy_days = RetentionPolicy.get_active_days(document_type=document_type)
 	if policy_days is not None:
 		return int(policy_days)
 	return int(getattr(django_settings, "DOCGEN_DEFAULT_ARCHIVE_DAYS", 365))
@@ -191,17 +192,25 @@ def _coerce_positive_int(value, default: int, max_value: int) -> int:
 	return max(1, min(parsed, max_value))
 
 
-def _issue_or_get_qr_token(document: Document) -> DocumentQRToken:
+def _issue_or_get_qr_token(document: Document, pdf_sha256: str = "") -> DocumentQRToken:
 	qr = getattr(document, "qr_token", None)
-	if qr is not None:
-		return qr
 
 	payload = {
 		"reference_number": document.reference_number,
 		"document_type": document.document_type,
-		"finalized_at": timezone.now().isoformat(),
+		"finalized_at": (document.finalized_at or timezone.now()).isoformat(),
 	}
+	if pdf_sha256:
+		payload["pdf_sha256"] = pdf_sha256
 	signed_payload = signing.dumps(payload, salt="docgen-verify")
+
+	if qr is not None:
+		# Update existing token's signed payload to include pdf hash if newly provided.
+		if pdf_sha256 and "pdf_sha256" not in (qr.signed_payload or ""):
+			qr.signed_payload = signed_payload
+			qr.save(update_fields=["signed_payload", "updated_at"])
+		return qr
+
 	token = uuid.uuid4().hex
 	return DocumentQRToken.objects.create(
 		document=document,
@@ -267,6 +276,40 @@ def _resolve_next_stage_order(document: Document, current_order: int, payload=No
 			if document.workflow_stages.filter(stage_order=next_stage_order).exists():
 				return next_stage_order
 
+	# M2: Evaluate branch_condition on the TemplateWorkflowStage definition.
+	# Try each candidate next stage in order; pick the first whose branch_condition matches.
+	doc_fields = document.field_values or {}
+	candidates = (
+		document.workflow_stages.filter(stage_order__gt=current_order)
+		.select_related("template_stage")
+		.order_by("stage_order", "id")
+	)
+	for candidate in candidates:
+		template_stage = getattr(candidate, "template_stage", None)
+		branch_cond = getattr(template_stage, "branch_condition", None) if template_stage else None
+		if not branch_cond or not isinstance(branch_cond, dict):
+			return candidate.stage_order  # no condition = unconditionally next
+		field_name = str(branch_cond.get("field") or "").strip()
+		operator = str(branch_cond.get("operator") or "eq").strip()
+		expected = branch_cond.get("value")
+		if not field_name:
+			return candidate.stage_order
+		actual = doc_fields.get(field_name)
+		match = False
+		if operator == "eq":
+			match = str(actual) == str(expected)
+		elif operator == "neq":
+			match = str(actual) != str(expected)
+		elif operator == "in":
+			match = str(actual) in [str(v) for v in (expected if isinstance(expected, list) else [expected])]
+		elif operator == "nin":
+			match = str(actual) not in [str(v) for v in (expected if isinstance(expected, list) else [expected])]
+		else:
+			match = str(actual) == str(expected)
+		if match:
+			return candidate.stage_order
+
+	# No branch condition matched — fall back to plain sequential next.
 	next_stage = (
 		document.workflow_stages.filter(stage_order__gt=current_order)
 		.order_by("stage_order", "id")
@@ -308,7 +351,7 @@ def index(request):
 @require_GET
 def verify_token(request, token: str):
 	try:
-		qr = DocumentQRToken.objects.select_related("document").get(token=token)
+		qr = DocumentQRToken.objects.select_related("document__originator").get(token=token)
 	except DocumentQRToken.DoesNotExist:
 		return JsonResponse({"valid": False, "reason": "token_not_found"}, status=404)
 
@@ -324,27 +367,52 @@ def verify_token(request, token: str):
 			status=400,
 		)
 
-	superseded_by = qr.document.superseded_by_documents.order_by("-created_at").first()
+	doc = qr.document
+	superseded_by = doc.superseded_by_documents.order_by("-created_at").first()
 	if superseded_by is not None:
 		return JsonResponse(
 			{
 				"valid": False,
 				"status": "superseded",
 				"reason": "document_superseded",
-				"reference_number": qr.document.reference_number,
-				"document_type": qr.document.document_type,
-				"finalized_at": qr.document.finalized_at,
+				"reference_number": doc.reference_number,
+				"document_type": doc.document_type,
+				"finalized_at": doc.finalized_at,
 				"superseded_by": superseded_by.reference_number,
 			}
 		)
+
+	# Resolve final approver (last acted APPROVE/APPROVE_WITH_COMMENTS stage)
+	final_approver_stage = (
+		doc.workflow_stages
+		.filter(required_action__in=["APPROVE", "APPROVE_WITH_COMMENTS"])
+		.exclude(acted_at=None)
+		.order_by("-stage_order", "-acted_at")
+		.select_related("acted_by")
+		.first()
+	)
+	final_approver = None
+	if final_approver_stage and final_approver_stage.acted_by:
+		actor = final_approver_stage.acted_by
+		full_name = actor.get_full_name()
+		final_approver = full_name if full_name else actor.username
+
+	originator_display = None
+	if doc.originator:
+		full_name = doc.originator.get_full_name()
+		originator_display = full_name if full_name else doc.originator.username
 
 	status = "revoked" if qr.is_revoked else "valid"
 	payload = {
 		"valid": not qr.is_revoked,
 		"status": status,
-		"reference_number": qr.document.reference_number,
-		"document_type": qr.document.document_type,
-		"finalized_at": qr.document.finalized_at,
+		"title": doc.title,
+		"reference_number": doc.reference_number,
+		"document_type": doc.document_type,
+		"originator": originator_display,
+		"approved_at": doc.approved_at,
+		"finalized_at": doc.finalized_at,
+		"final_approver": final_approver,
 	}
 	if qr.is_revoked:
 		payload["revoked_reason"] = qr.revoked_reason
@@ -657,7 +725,7 @@ def document_submit(request, document_id: int):
 		return JsonResponse({"error": "Only draft or returned documents can be submitted."}, status=400)
 
 	if not document.reference_number:
-		document.assign_reference_number(org_code="HQ")
+		document.assign_reference_number()
 
 	route_status = DocumentStatus.UNDER_REVIEW
 	document.submitted_at = timezone.now()
@@ -935,11 +1003,37 @@ def document_finalize(request, document_id: int):
 		actor=request.user if request.user.is_authenticated else None,
 	)
 	document.save(update_fields=["status", "finalized_at", "metadata", "updated_at"])
-	qr = _issue_or_get_qr_token(document)
+	# Issue QR token first (without hash); PDF generated next.
+	# If Celery is available, generate the PDF asynchronously and update the token later.
+	# If not, fall back to synchronous generation so the hash is available immediately.
+	_use_async = bool(getattr(django_settings, "DOCGEN_ASYNC_PDF_GENERATION", False))
+	actor_id = request.user.id if request.user.is_authenticated else None
+
+	if _use_async:
+		qr = _issue_or_get_qr_token(document)
+		_snapshot_document(document, actor=request.user if request.user.is_authenticated else None)
+		from .tasks import generate_pdf_artifact_task  # noqa: PLC0415
+		generate_pdf_artifact_task.delay(document_id=document.id, generated_by_id=actor_id)
+		verify_url = reverse("docgen:verify-token", kwargs={"token": qr.token})
+		return JsonResponse(
+			{
+				"document_id": document.id,
+				"status": document.status,
+				"finalized_at": document.finalized_at,
+				"qr_token": qr.token,
+				"verify_url": verify_url,
+				"pdf_version": None,
+				"pdf_sha256": None,
+				"pdf_generation": "queued",
+			}
+		)
+
+	# Synchronous path (default): generate PDF then embed hash in QR token.
 	pdf = generate_pdf_artifact(
 		document=document,
 		generated_by=request.user if request.user.is_authenticated else None,
 	)
+	qr = _issue_or_get_qr_token(document, pdf_sha256=pdf.sha256_hash)
 	_snapshot_document(document, actor=request.user if request.user.is_authenticated else None)
 
 	verify_url = reverse("docgen:verify-token", kwargs={"token": qr.token})
@@ -971,7 +1065,7 @@ def document_archive(request, document_id: int):
 			{
 				"document_id": document.id,
 				"status": document.status,
-				"retention_days": _archive_retention_days(),
+				"retention_days": _archive_retention_days(document_type=document.document_type),
 				"forced": False,
 				"archived_at": document.archived_at,
 			}
@@ -987,7 +1081,7 @@ def document_archive(request, document_id: int):
 			return JsonResponse({"error": str(error)}, status=400)
 
 	force = bool(payload.get("force", False))
-	retention_days = _archive_retention_days()
+	retention_days = _archive_retention_days(document_type=document.document_type)
 	if not force:
 		if document.finalized_at is None:
 			return JsonResponse({"error": "Document missing finalized timestamp."}, status=400)
@@ -1723,22 +1817,34 @@ def document_collection(request):
 		if document_type_filter:
 			queryset = queryset.filter(document_type=document_type_filter)
 
+		classification_filter = request.GET.get("classification")
+		if classification_filter:
+			queryset = queryset.filter(classification=classification_filter)
+
 		originator_filter = request.GET.get("originator")
 		if originator_filter:
 			queryset = queryset.filter(originator__username=originator_filter)
 
-		submitted_after = request.GET.get("submitted_after")
-		if submitted_after:
-			parsed = parse_datetime(submitted_after)
+		originator_id_filter = request.GET.get("originator_id")
+		if originator_id_filter:
+			try:
+				queryset = queryset.filter(originator_id=int(originator_id_filter))
+			except (ValueError, TypeError):
+				return JsonResponse({"error": "originator_id must be an integer."}, status=400)
+
+		# Support both submitted_after/submitted_before and from_date/to_date aliases.
+		submitted_after_raw = request.GET.get("submitted_after") or request.GET.get("from_date")
+		if submitted_after_raw:
+			parsed = parse_datetime(submitted_after_raw)
 			if parsed is None:
-				return JsonResponse({"error": "submitted_after must be a valid ISO datetime."}, status=400)
+				return JsonResponse({"error": "submitted_after/from_date must be a valid ISO datetime."}, status=400)
 			queryset = queryset.filter(submitted_at__gte=parsed)
 
-		submitted_before = request.GET.get("submitted_before")
-		if submitted_before:
-			parsed = parse_datetime(submitted_before)
+		submitted_before_raw = request.GET.get("submitted_before") or request.GET.get("to_date")
+		if submitted_before_raw:
+			parsed = parse_datetime(submitted_before_raw)
 			if parsed is None:
-				return JsonResponse({"error": "submitted_before must be a valid ISO datetime."}, status=400)
+				return JsonResponse({"error": "submitted_before/to_date must be a valid ISO datetime."}, status=400)
 			queryset = queryset.filter(submitted_at__lte=parsed)
 
 		limit = _coerce_positive_int(request.GET.get("limit"), default=50, max_value=200)
@@ -1750,9 +1856,14 @@ def document_collection(request):
 				"title": doc.title,
 				"subject": doc.subject,
 				"document_type": doc.document_type,
+				"classification": doc.classification,
 				"status": doc.status,
 				"reference_number": doc.reference_number,
 				"originator": doc.originator.username if doc.originator else None,
+				"originator_name": (
+					doc.originator.get_full_name() or doc.originator.username
+					if doc.originator else None
+				),
 				"template_revision": doc.template_revision.version,
 				"submitted_at": doc.submitted_at,
 				"created_at": doc.created_at,
@@ -2093,3 +2204,82 @@ def document_pdf_generate(request, document_id: int):
 		},
 		status=201,
 	)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard widget endpoints
+# ---------------------------------------------------------------------------
+
+@require_GET
+def widget_pending_approvals(request):
+	"""Return pending approval stages for the authenticated user (or global count for admins)."""
+	if not request.user.is_authenticated:
+		return JsonResponse({"error": "Authentication required."}, status=401)
+
+	active_stages = DocumentWorkflowStage.objects.select_related("document").filter(
+		status__in=[DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL],
+		document__status__in=[DocumentStatus.UNDER_REVIEW, DocumentStatus.UNDER_APPROVAL],
+	)
+
+	is_admin = _has_docgen_role(request.user, {"docgen.admin"})
+	if not is_admin:
+		# Filter to stages where this user is the assigned actor.
+		username = request.user.username
+		active_stages = active_stages.filter(
+			Q(actor_type="USER", actor_value=username)
+		)
+
+	limit = _coerce_positive_int(request.GET.get("limit"), default=20, max_value=100)
+	stages = list(active_stages.order_by("due_at", "id")[:limit])
+
+	results = [
+		{
+			"stage_id": stage.id,
+			"document_id": stage.document_id,
+			"reference_number": stage.document.reference_number,
+			"document_title": stage.document.title,
+			"document_type": stage.document.document_type,
+			"stage_title": stage.title,
+			"required_action": stage.required_action,
+			"actor_value": stage.actor_value,
+			"due_at": stage.due_at,
+			"status": stage.status,
+		}
+		for stage in stages
+	]
+	return JsonResponse({"count": len(results), "results": results})
+
+
+@require_GET
+def widget_recent_documents(request):
+	"""Return recently created/updated documents for the authenticated user."""
+	if not request.user.is_authenticated:
+		return JsonResponse({"error": "Authentication required."}, status=401)
+
+	queryset = Document.objects.select_related("originator").all()
+
+	is_admin = _has_docgen_role(request.user, {"docgen.admin"})
+	if not is_admin:
+		# Show documents originated by this user or involving them in a workflow stage.
+		queryset = queryset.filter(
+			Q(originator=request.user) |
+			Q(workflow_stages__actor_type="USER", workflow_stages__actor_value=request.user.username)
+		).distinct()
+
+	limit = _coerce_positive_int(request.GET.get("limit"), default=10, max_value=50)
+	documents = list(queryset.order_by("-updated_at")[:limit])
+
+	results = [
+		{
+			"id": doc.id,
+			"title": doc.title,
+			"document_type": doc.document_type,
+			"status": doc.status,
+			"reference_number": doc.reference_number,
+			"originator": doc.originator.username if doc.originator else None,
+			"updated_at": doc.updated_at,
+		}
+		for doc in documents
+	]
+	return JsonResponse({"count": len(results), "results": results})
+
