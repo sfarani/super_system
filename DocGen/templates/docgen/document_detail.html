@@ -47,20 +47,40 @@
   quillSaveTimers: {},
   templateTokens: {{ template_tokens_json }},
   tokenRows: {{ token_table_rows_json|default:'[]' }},
+  hasBodyTextToken: {{ has_body_text_token|yesno:'true,false' }},
   inheritedTokens: {{ inherited_tokens_json }},
   inheritedTokenSources: {{ inherited_token_sources_json }},
   tokenSaving: false,
+  bodyTokenAutosaving: false,
+  bodyTokenAutosaveTimer: null,
+  bodyTokenSaveStatus: '',
   saving: false,
   actionSubmitting: false,
   actionError: '',
 
   init() {
     if (!Array.isArray(this.tokenRows)) this.tokenRows = [];
-    this.$nextTick(() => this.initBodyRichTextEditor());
+    this.$nextTick(() => {
+      this.initBodyRichTextEditor();
+      this.initTokenBodyRichTextEditor();
+    });
   },
 
   isEditableStatus() {
     return ['DRAFT', 'RETURNED'].includes('{{ document.status }}');
+  },
+
+  getBodyTokenRow() {
+    let row = (this.tokenRows || []).find(r => String(r && r.key ? r.key : '') === 'body_text');
+    if (!row && this.hasBodyTextToken) {
+      row = { key: 'body_text', value: '', used_in_layout: true };
+      this.tokenRows.push(row);
+    }
+    return row || null;
+  },
+
+  visibleTokenRows() {
+    return (this.tokenRows || []).filter(r => String(r && r.key ? r.key : '') !== 'body_text');
   },
 
   initBodyRichTextEditor() {
@@ -98,6 +118,52 @@
     });
 
     this.quillEditors[fieldName] = quill;
+  },
+
+  initTokenBodyRichTextEditor() {
+    if (!this.isEditableStatus() || !window.Quill) return;
+    const tokenKey = 'body_text';
+    const row = this.getBodyTokenRow();
+    const host = document.getElementById('quill-token-body-text');
+    if (!row || !host || this.quillEditors[tokenKey]) return;
+
+    const quill = new window.Quill(host, {
+      theme: 'snow',
+      modules: {
+        toolbar: [
+          [{ header: [1, 2, false] }],
+          ['bold', 'italic', 'underline'],
+          [{ list: 'ordered' }, { list: 'bullet' }],
+          ['clean']
+        ]
+      }
+    });
+
+    if (row.value) {
+      quill.root.innerHTML = row.value;
+    }
+
+    quill.on('text-change', () => {
+      row.value = quill.root.innerHTML;
+      this.scheduleBodyTokenAutosave();
+    });
+
+    this.quillEditors[tokenKey] = quill;
+  },
+
+  scheduleBodyTokenAutosave() {
+    if (!this.isEditableStatus()) return;
+    this.bodyTokenSaveStatus = 'Unsaved changes';
+    clearTimeout(this.bodyTokenAutosaveTimer);
+    this.bodyTokenAutosaveTimer = setTimeout(async () => {
+      this.bodyTokenAutosaving = true;
+      await this.saveTemplateTokens(true);
+      this.bodyTokenAutosaving = false;
+      this.bodyTokenSaveStatus = 'Saved';
+      setTimeout(() => {
+        if (this.bodyTokenSaveStatus === 'Saved') this.bodyTokenSaveStatus = '';
+      }, 1800);
+    }, 700);
   },
 
   get statusColor() {
@@ -172,7 +238,7 @@
     });
   },
 
-  async saveTemplateTokens() {
+  async saveTemplateTokens(silent = false) {
     this.tokenSaving = true;
     const parsed = {};
     (this.tokenRows || []).forEach(row => {
@@ -190,10 +256,11 @@
     this.tokenSaving = false;
     if (resp.ok) {
       this.templateTokens = parsed;
-      alert('Template tokens saved.');
+      if (!silent) alert('Template tokens saved.');
     } else {
       const d = await resp.json().catch(() => ({}));
-      alert(d.error || 'Failed to save template tokens.');
+      if (!silent) alert(d.error || 'Failed to save template tokens.');
+      else this.bodyTokenSaveStatus = d.error || 'Autosave failed';
     }
   },
 
@@ -514,12 +581,12 @@
         </div>
 
         {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
-          <template x-if="tokenRows.length === 0">
+          <template x-if="visibleTokenRows().length === 0">
             <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-3 text-sm text-slate-500">
               No editable template tokens detected in this layout.
             </div>
           </template>
-          <template x-if="tokenRows.length > 0">
+          <template x-if="visibleTokenRows().length > 0">
             <div class="border border-slate-200 rounded-lg overflow-hidden">
               <table class="w-full text-sm">
                 <thead>
@@ -531,7 +598,7 @@
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-100">
-                  <template x-for="row in tokenRows" :key="row.key">
+                  <template x-for="row in visibleTokenRows()" :key="row.key">
                     <tr>
                       <td class="px-3 py-2 align-top">
                         <div class="flex items-center gap-1.5 flex-wrap">
@@ -583,10 +650,10 @@
           </button>
         {% else %}
           <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-            <template x-if="tokenRows.length === 0">
+            <template x-if="visibleTokenRows().length === 0">
               <p class="text-sm text-slate-500">No custom [] token values set.</p>
             </template>
-            <template x-for="row in tokenRows" :key="row.key + '-ro'">
+            <template x-for="row in visibleTokenRows()" :key="row.key + '-ro'">
               <template x-if="tokenEffectiveValue(row)">
                 <p class="text-sm text-slate-700"><span class="font-mono" x-text="row.key"></span>=<span x-text="tokenEffectiveValue(row)"></span></p>
               </template>
@@ -595,6 +662,31 @@
         {% endif %}
       </div>
 
+    </div>
+  </div>
+
+  <!-- TAB: Body Text Token -->
+  <div x-show="activeTab === 'body_text'" x-cloak>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5">
+      <h3 class="font-semibold text-slate-700 mb-2">Body Text</h3>
+      <p class="text-xs text-slate-500 mb-3">Dedicated rich text editor for the body_text token used in this template layout.</p>
+
+      {% if document.status == 'DRAFT' or document.status == 'RETURNED' %}
+        <div class="border border-slate-300 rounded-lg overflow-hidden docgen-quill">
+          <div id="quill-token-body-text"></div>
+        </div>
+        <div class="mt-2 flex items-center gap-2 text-xs">
+          <span x-show="bodyTokenAutosaving" class="text-amber-600">Autosaving...</span>
+          <span x-show="!bodyTokenAutosaving && bodyTokenSaveStatus" class="text-slate-500" x-text="bodyTokenSaveStatus"></span>
+        </div>
+        <button @click="saveTemplateTokens(false)" :disabled="tokenSaving"
+                class="mt-3 bg-compass-600 hover:bg-compass-700 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg">
+          <span x-text="tokenSaving ? 'Saving…' : 'Save Body Text'" ></span>
+        </button>
+      {% else %}
+        <div class="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 min-h-[120px] leading-relaxed"
+             x-html="tokenEffectiveValue(getBodyTokenRow()) || '<span class=\'text-slate-400\'>No body text value set.</span>'"></div>
+      {% endif %}
     </div>
   </div>
 

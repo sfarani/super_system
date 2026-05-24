@@ -5,8 +5,10 @@ from html.parser import HTMLParser
 from io import BytesIO
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+from urllib.parse import urlparse, unquote
 
 from django.conf import settings
 from django.contrib.staticfiles import finders
@@ -298,6 +300,50 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
 
     right_logo_src = _resolve_logo_src(selected_right_logo_url)
 
+    def _local_path_from_uri(uri: str) -> Path | None:
+        raw = str(uri or "").strip()
+        if not raw:
+            return None
+        lower_raw = raw.lower()
+        if lower_raw.startswith("file://"):
+            parsed = urlparse(raw)
+            path_str = unquote(parsed.path or "")
+            if path_str.startswith("/") and len(path_str) > 2 and path_str[2] == ":":
+                path_str = path_str[1:]
+            candidate = Path(path_str)
+            return candidate if candidate.exists() else None
+        candidate = Path(raw)
+        if candidate.is_absolute() and candidate.exists():
+            return candidate
+        return None
+
+    def _logo_img_style(src: str, max_w_px: int = 190, max_h_px: int = 64) -> str:
+        """Return a PDF-safe logo style that keeps image aspect ratio (no skew)."""
+        fallback = (
+            f"display:inline-block;width:auto;height:{max_h_px}px;"
+            f"max-width:{max_w_px}px;"
+        )
+        local_path = _local_path_from_uri(src)
+        if local_path is None:
+            return fallback
+        try:
+            from PIL import Image  # type: ignore[import]
+
+            with Image.open(local_path) as image:
+                width_px, height_px = image.size
+            if width_px <= 0 or height_px <= 0:
+                return fallback
+            scale = min(max_w_px / float(width_px), max_h_px / float(height_px), 1.0)
+            render_w = max(1, int(round(width_px * scale)))
+            render_h = max(1, int(round(height_px * scale)))
+            return (
+                "display:inline-block;"
+                f"width:{render_w}px;"
+                f"height:{render_h}px;"
+            )
+        except Exception:
+            return fallback
+
     def _resolve_pdf_font(font_key: str) -> str:
         key = str(font_key or "helvetica").lower()
         if key == "times":
@@ -366,13 +412,15 @@ def _build_layout_blocks_html(document: Document, render_context: dict[str, str]
 
         if block_type == "letterhead":
             content_html = escape(content).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+            left_logo_style = _logo_img_style(left_logo_src)
+            right_logo_style = _logo_img_style(right_logo_src)
             left_img_html = (
-                f"<img src='{escape(left_logo_src)}' style='height:64px;max-width:190px;' />"
+                f"<img src='{escape(left_logo_src)}' style='{left_logo_style}' />"
                 if left_logo_src
                 else ""
             )
             right_img_html = (
-                f"<img src='{escape(right_logo_src)}' style='height:64px;max-width:190px;' />"
+                f"<img src='{escape(right_logo_src)}' style='{right_logo_style}' />"
                 if right_logo_src
                 else ""
             )
@@ -615,8 +663,64 @@ def _build_pdf_html(document: Document, include_diagnostics: bool = False) -> st
 
 
 def _render_html_to_pdf_bytes(html: str) -> bytes:
+    def _pisa_link_callback(uri: str, rel: str) -> str:
+        _ = rel
+        raw_uri = str(uri or "").strip()
+        if not raw_uri:
+            return raw_uri
+
+        lower_uri = raw_uri.lower()
+        if lower_uri.startswith(("http://", "https://", "data:")):
+            return raw_uri
+
+        if lower_uri.startswith("file://"):
+            parsed = urlparse(raw_uri)
+            file_path = unquote(parsed.path or "")
+            if file_path.startswith("/") and len(file_path) > 2 and file_path[2] == ":":
+                file_path = file_path[1:]
+            if file_path and os.path.exists(file_path):
+                return file_path
+
+        static_url = str(getattr(settings, "STATIC_URL", "/static/") or "/static/")
+        media_url = str(getattr(settings, "MEDIA_URL", "/media/") or "/media/")
+        if not static_url.startswith("/"):
+            static_url = "/" + static_url
+        if not media_url.startswith("/"):
+            media_url = "/" + media_url
+
+        if raw_uri.startswith(static_url):
+            rel_path = raw_uri[len(static_url):].lstrip("/")
+            found = finders.find(rel_path)
+            if found and os.path.exists(found):
+                return found
+            fallback = Path(settings.BASE_DIR) / "static" / rel_path
+            if fallback.exists():
+                return str(fallback)
+
+        if raw_uri.startswith(media_url):
+            rel_path = raw_uri[len(media_url):].lstrip("/")
+            media_root = getattr(settings, "MEDIA_ROOT", "")
+            if media_root:
+                candidate = Path(media_root) / rel_path
+                if candidate.exists():
+                    return str(candidate)
+
+        if os.path.isabs(raw_uri) and os.path.exists(raw_uri):
+            return raw_uri
+
+        base_candidate = Path(settings.BASE_DIR) / raw_uri.lstrip("/")
+        if base_candidate.exists():
+            return str(base_candidate)
+
+        return raw_uri
+
     output = BytesIO()
-    render_result = pisa.CreatePDF(src=html, dest=output, encoding="utf-8")
+    render_result = pisa.CreatePDF(
+        src=html,
+        dest=output,
+        encoding="utf-8",
+        link_callback=_pisa_link_callback,
+    )
     if render_result.err:
         raise ValidationError("PDF rendering failed.")
     return output.getvalue()

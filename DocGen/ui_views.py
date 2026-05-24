@@ -321,6 +321,7 @@ def document_detail_ui(request, document_id: int):
         if token and token not in placeholder_names and token not in _RESERVED_RENDER_TOKENS
     )
     table_keys = sorted(set(editable_layout_tokens) | set(template_tokens_map.keys()))
+    has_body_text_token = "body_text" in table_keys
     token_table_rows = [
         {
             "key": key,
@@ -406,11 +407,15 @@ def document_detail_ui(request, document_id: int):
     # Determine which tabs to show
     tabs = [
         ("details", "Details"),
+    ]
+    if has_body_text_token:
+        tabs.append(("body_text", "Body Text"))
+    tabs.extend([
         ("workflow", "Workflow"),
         ("timeline", "Timeline"),
         ("comments", "Comments"),
         ("attachments", "Attachments"),
-    ]
+    ])
     if pdf_list:
         tabs.append(("pdfs", "PDFs"))
 
@@ -422,6 +427,7 @@ def document_detail_ui(request, document_id: int):
         "fields_rich_json": fields_rich_json,
         "template_tokens_json": template_tokens_json,
         "token_table_rows_json": token_table_rows_json,
+        "has_body_text_token": has_body_text_token,
         "inherited_tokens_json": inherited_tokens_json,
         "inherited_token_sources_json": inherited_token_sources_json,
         "workflow_stages": wf_data,
